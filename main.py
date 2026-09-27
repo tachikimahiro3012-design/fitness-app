@@ -1,8 +1,11 @@
 import calendar
 import datetime
+import json
 import sqlite3
 import pandas as pd
+from PIL import Image
 import streamlit as st
+from google import genai
 
 # --------------------------------------------------
 # ページ基本設定
@@ -64,9 +67,16 @@ def init_db():
             weight REAL,
             activity_level TEXT,
             steps INTEGER,
-            goal_phase TEXT
+            goal_phase TEXT,
+            api_key TEXT
         )
     """)
+
+    # カラム追加のフォールバック
+    try:
+        c.execute("ALTER TABLE user_profile ADD COLUMN api_key TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     default_exercises = [
         ("胸", "ベンチプレス"),
@@ -112,6 +122,39 @@ def init_db():
 
     conn.commit()
     return conn
+
+
+# --------------------------------------------------
+# Gemini AIによる画像解析関数
+# --------------------------------------------------
+def analyze_food_image(image: Image.Image, api_key: str):
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = """
+        添付された食事の画像を解析し、おおよそのカロリー（kcal）と料理の名称・内訳を推定してください。
+        回答は必ず以下の純粋なJSONフォーマットのみで出力してください（Markdownのバックトウや装飾は不要です）。
+
+        {
+            "dish_name": "推定される料理名や内容",
+            "total_calories": 推定合計カロリー(数値のみ),
+            "meal_type": "朝食", "昼食", "夕食", "間食" のいずれか最も可能性が高いもの,
+            "description": "内訳や理由の短い補足コメント"
+        }
+        """
+        response = client.models.generate_content(
+            model="gemini-2.5-flash", contents=[image, prompt]
+        )
+
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        return json.loads(text), None
+    except Exception as e:
+        return None, str(e)
 
 
 # BMR / TDEE / 目標カロリー計算
@@ -162,7 +205,7 @@ def calculate_workout_burn(weight, duration_min, intensity):
 
 
 # --------------------------------------------------
-# 赤基調UI用の共通スタイル・部品
+# UI用CSS
 # --------------------------------------------------
 def inject_theme_css():
     st.markdown(
@@ -173,7 +216,6 @@ def inject_theme_css():
             --brand-red-dark: #c92a3d;
         }
 
-        /* 見出し用の赤バナー */
         .section-banner {
             background: var(--brand-red);
             color: #ffffff;
@@ -184,7 +226,6 @@ def inject_theme_css():
             margin: 18px 0 10px;
         }
 
-        /* アプリ最上部のタイトルバー */
         .app-header {
             background: var(--brand-red);
             color: #ffffff;
@@ -195,7 +236,6 @@ def inject_theme_css():
         .app-header .app-title { font-size: 1.15rem; font-weight: 800; }
         .app-header .app-date { font-size: 0.8rem; opacity: 0.9; margin-top: 2px; }
 
-        /* ボタンのスタイル修正（選択済み／未選択の文字色バグを修正） */
         button[kind="primary"] {
             background-color: var(--brand-red) !important;
             border-color: var(--brand-red) !important;
@@ -218,13 +258,11 @@ def inject_theme_css():
             color: #111827 !important;
         }
 
-        /* 背景・文字色の保険 */
         [data-testid="stAppViewContainer"], .main {
             background-color: #ffffff !important;
             color: #111827 !important;
         }
 
-        /* 画面幅が狭いときにst.columnsが縦積みに崩れないようにする */
         div[data-testid="stHorizontalBlock"] {
             flex-direction: row !important;
             flex-wrap: nowrap !important;
@@ -235,7 +273,6 @@ def inject_theme_css():
             min-width: 0 !important;
         }
 
-        /* 種目カードのセット表 */
         .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
         .ex-card-header { background: var(--brand-red); color: #fff; font-weight: 700;
                            padding: 8px 12px; font-size: 0.95rem; }
@@ -256,15 +293,25 @@ def main():
     conn = init_db()
     c = conn.cursor()
 
-    # プロフィール取得
     profile = c.execute(
-        "SELECT gender, age, height, weight, activity_level, steps, goal_phase FROM user_profile WHERE id = 1"
+        "SELECT gender, age, height, weight, activity_level, steps, goal_phase, api_key FROM user_profile WHERE id = 1"
     ).fetchone()
 
     if profile:
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal = profile
+        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal, p_api_key = (
+            profile
+        )
     else:
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal = (
+        (
+            p_gender,
+            p_age,
+            p_height,
+            p_weight,
+            p_act,
+            p_steps,
+            p_goal,
+            p_api_key,
+        ) = (
             "男性",
             25,
             170.0,
@@ -272,15 +319,20 @@ def main():
             "週3〜4回運動",
             8000,
             "標準増量 (+300 kcal)",
+            "",
         )
 
     # サイドバー：設定
     st.sidebar.title("ユーザー設定")
     with st.sidebar.form("profile_form"):
+        api_key_input = st.text_input(
+            "Gemini API Key",
+            value=p_api_key if p_api_key else "",
+            type="password",
+            help="Google AI Studioで取得したAPIキーを入力してください",
+        )
         gender = st.selectbox(
-            "性別",
-            ["男性", "女性"],
-            index=0 if p_gender == "男性" else 1,
+            "性別", ["男性", "女性"], index=0 if p_gender == "男性" else 1
         )
         age = st.number_input("年齢", min_value=10, max_value=100, value=p_age)
         height = st.number_input(
@@ -342,10 +394,19 @@ def main():
         if st.form_submit_button("設定を保存"):
             c.execute(
                 """
-                INSERT OR REPLACE INTO user_profile (id, gender, age, height, weight, activity_level, steps, goal_phase)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO user_profile (id, gender, age, height, weight, activity_level, steps, goal_phase, api_key)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (gender, age, height, weight, act_level, steps, goal_phase),
+                (
+                    gender,
+                    age,
+                    height,
+                    weight,
+                    act_level,
+                    steps,
+                    goal_phase,
+                    api_key_input.strip(),
+                ),
             )
             conn.commit()
             st.sidebar.success("設定を更新しました。")
@@ -376,7 +437,6 @@ def main():
         p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal
     )
 
-    # 今日のデータ取得
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
     food_row = c.execute(
@@ -393,10 +453,8 @@ def main():
         workout_burn_row[0] if workout_burn_row[0] is not None else 0.0
     )
 
-    # アプリ全体の見た目(赤基調テーマ)
     inject_theme_css()
 
-    # アプリタイトル(赤ヘッダーバナー)
     st.markdown(
         f"""
         <div class="app-header">
@@ -407,11 +465,9 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 画面切り替え
     if "view" not in st.session_state:
         st.session_state.view = "dashboard"
 
-    # 上部ナビゲーション
     nav_items = [
         ("dashboard", "ホーム"),
         ("food", "食事記録"),
@@ -432,7 +488,7 @@ def main():
     st.divider()
 
     # --------------------------------------------------
-    # 画面1: 今日の状態（ダッシュボード）
+    # 画面1: ホーム
     # --------------------------------------------------
     if st.session_state.view == "dashboard":
         red_banner("今日の状態")
@@ -513,7 +569,6 @@ def main():
 
         st.divider()
 
-        # カレンダー表示
         now = datetime.date.today()
         today_str_display = now.strftime("%Y-%m-%d")
         st.subheader(f"{now.year}年 {now.month}月")
@@ -626,7 +681,7 @@ def main():
         )
 
     # --------------------------------------------------
-    # 画面2: 食事記録
+    # 画面2: 食事記録（AIカメラ追加）
     # --------------------------------------------------
     elif st.session_state.view == "food":
         red_banner("食事カロリー入力")
@@ -639,43 +694,124 @@ def main():
             (f_date_str,),
         ).fetchone()
 
-        init_b = f_row[0] if f_row else 0.0
-        init_l = f_row[1] if f_row else 0.0
-        init_d = f_row[2] if f_row else 0.0
-        init_s = f_row[3] if f_row else 0.0
+        # Session Stateの初期化
+        if "ai_b" not in st.session_state:
+            st.session_state.ai_b = f_row[0] if f_row else 0.0
+        if "ai_l" not in st.session_state:
+            st.session_state.ai_l = f_row[1] if f_row else 0.0
+        if "ai_d" not in st.session_state:
+            st.session_state.ai_d = f_row[2] if f_row else 0.0
+        if "ai_s" not in st.session_state:
+            st.session_state.ai_s = f_row[3] if f_row else 0.0
 
-        col_b, col_l, col_d, col_s = st.columns(4)
-        with col_b:
-            in_b = st.number_input(
-                "朝食 (kcal)", min_value=0.0, value=float(init_b), step=50.0
-            )
-        with col_l:
-            in_l = st.number_input(
-                "昼食 (kcal)", min_value=0.0, value=float(init_l), step=50.0
-            )
-        with col_d:
-            in_d = st.number_input(
-                "夕食 (kcal)", min_value=0.0, value=float(init_d), step=50.0
-            )
-        with col_s:
-            in_s = st.number_input(
-                "間食 (kcal)", min_value=0.0, value=float(init_s), step=50.0
-            )
+        tab1, tab2 = st.tabs(["手入力", "📸 AIカメラ/写真解析"])
 
-        sub_total = in_b + in_l + in_d + in_s
-        st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
+        with tab2:
+            st.markdown("#### 写真からカロリーを推定")
+            if not p_api_key:
+                st.warning(
+                    "左側のサイドバーメニュー（ユーザー設定）に Gemini API キーを入力してください。"
+                )
+            else:
+                img_source = st.radio(
+                    "入力方法",
+                    ["カメラ撮影", "画像ファイル選択"],
+                    horizontal=True,
+                )
+                uploaded_img = None
 
-        if st.button("食事記録を保存", type="primary"):
-            c.execute(
-                """
-                INSERT OR REPLACE INTO food_logs (date, breakfast_cal, lunch_cal, dinner_cal, snack_cal)
-                VALUES (?, ?, ?, ?, ?)
-            """,
-                (f_date_str, in_b, in_l, in_d, in_s),
-            )
-            conn.commit()
-            st.success("食事記録を保存しました。")
-            st.rerun()
+                if img_source == "カメラ撮影":
+                    uploaded_img = st.camera_input("料理を撮影してください")
+                else:
+                    uploaded_img = st.file_uploader(
+                        "画像を選択してください",
+                        type=["jpg", "jpeg", "png", "webp"],
+                    )
+
+                if uploaded_img is not None:
+                    image = Image.open(uploaded_img)
+                    st.image(
+                        image, caption="解析対象の画像", use_container_width=True
+                    )
+
+                    if st.button("AIでカロリーを判定", type="primary"):
+                        with st.spinner("AIが食事内容とカロリーを解析中..."):
+                            result, error = analyze_food_image(image, p_api_key)
+                            if error:
+                                st.error(f"解析エラー: {error}")
+                            else:
+                                st.session_state.ai_result = result
+
+                if "ai_result" in st.session_state:
+                    res = st.session_state.ai_result
+                    st.success("解析が完了しました！")
+                    st.write(f"**料理名:** {res.get('dish_name')}")
+                    st.write(
+                        f"**推定カロリー:** 約 {res.get('total_calories')} kcal"
+                    )
+                    st.write(f"**推奨区分:** {res.get('meal_type')}")
+                    st.caption(f"メモ: {res.get('description')}")
+
+                    if st.button("この結果を入力欄に反映する"):
+                        m_type = res.get("meal_type")
+                        c_val = float(res.get("total_calories", 0))
+
+                        if m_type == "朝食":
+                            st.session_state.ai_b = c_val
+                        elif m_type == "昼食":
+                            st.session_state.ai_l = c_val
+                        elif m_type == "夕食":
+                            st.session_state.ai_d = c_val
+                        else:
+                            st.session_state.ai_s = c_val
+
+                        st.success("入力欄に反映しました！「手入力」タブで保存を行ってください。")
+
+        with tab1:
+            col_b, col_l, col_d, col_s = st.columns(4)
+            with col_b:
+                in_b = st.number_input(
+                    "朝食 (kcal)",
+                    min_value=0.0,
+                    value=float(st.session_state.ai_b),
+                    step=50.0,
+                )
+            with col_l:
+                in_l = st.number_input(
+                    "昼食 (kcal)",
+                    min_value=0.0,
+                    value=float(st.session_state.ai_l),
+                    step=50.0,
+                )
+            with col_d:
+                in_d = st.number_input(
+                    "夕食 (kcal)",
+                    min_value=0.0,
+                    value=float(st.session_state.ai_d),
+                    step=50.0,
+                )
+            with col_s:
+                in_s = st.number_input(
+                    "間食 (kcal)",
+                    min_value=0.0,
+                    value=float(st.session_state.ai_s),
+                    step=50.0,
+                )
+
+            sub_total = in_b + in_l + in_d + in_s
+            st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
+
+            if st.button("食事記録を保存", type="primary"):
+                c.execute(
+                    """
+                    INSERT OR REPLACE INTO food_logs (date, breakfast_cal, lunch_cal, dinner_cal, snack_cal)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                    (f_date_str, in_b, in_l, in_d, in_s),
+                )
+                conn.commit()
+                st.success("食事記録を保存しました。")
+                st.rerun()
 
     # --------------------------------------------------
     # 画面3: 筋トレ記録
