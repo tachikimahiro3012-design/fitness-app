@@ -17,7 +17,6 @@ st.set_page_config(
 # --------------------------------------------------
 # データベース初期化
 # --------------------------------------------------
-
 def init_db():
     conn = sqlite3.connect("workout.db", check_same_thread=False)
     c = conn.cursor()
@@ -103,12 +102,13 @@ def init_db():
         ("脚", "インナーサイ"),
     ]
 
-    # 既存の種目を一旦クリアして最新リストに更新する
-    c.execute("DELETE FROM exercises")
-    c.executemany(
-        "INSERT OR IGNORE INTO exercises (part, name) VALUES (?, ?)",
-        default_exercises,
-    )
+    c.execute("SELECT COUNT(*) FROM exercises")
+    exercise_count = c.fetchone()[0]
+    if exercise_count == 0:
+        c.executemany(
+            "INSERT OR IGNORE INTO exercises (part, name) VALUES (?, ?)",
+            default_exercises,
+        )
 
     conn.commit()
     return conn
@@ -150,8 +150,8 @@ def calculate_nutrition_targets(
 # METs計算
 def calculate_workout_burn(weight, duration_min, intensity):
     mets_map = {
-        "軽度 (ストレッチ/自重/休憩長め)": 3.5,
         "標準 (通常のウェイトトレーニング)": 6.0,
+        "軽度 (ストレッチ/自重/休憩長め)": 3.5,
         "高強度 (サーキット/高密度/スーパーセット)": 8.0,
     }
     mets = mets_map.get(intensity, 6.0)
@@ -159,6 +159,97 @@ def calculate_workout_burn(weight, duration_min, intensity):
         return 0.0
     burn = (mets - 1.0) * weight * (duration_min / 60.0) * 1.05
     return round(burn, 1)
+
+
+# --------------------------------------------------
+# 赤基調UI用の共通スタイル・部品
+# --------------------------------------------------
+def inject_theme_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --brand-red: #e63946;
+            --brand-red-dark: #c92a3d;
+        }
+
+        /* 見出し用の赤バナー */
+        .section-banner {
+            background: var(--brand-red);
+            color: #ffffff;
+            font-weight: 700;
+            font-size: 1.05rem;
+            padding: 10px 14px;
+            border-radius: 10px;
+            margin: 18px 0 10px;
+        }
+
+        /* アプリ最上部のタイトルバー */
+        .app-header {
+            background: var(--brand-red);
+            color: #ffffff;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+        }
+        .app-header .app-title { font-size: 1.15rem; font-weight: 800; }
+        .app-header .app-date { font-size: 0.8rem; opacity: 0.9; margin-top: 2px; }
+
+        /* ボタンのスタイル修正（選択済み／未選択の文字色バグを修正） */
+        button[kind="primary"] {
+            background-color: var(--brand-red) !important;
+            border-color: var(--brand-red) !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+        button[kind="primary"]:hover {
+            background-color: var(--brand-red-dark) !important;
+            border-color: var(--brand-red-dark) !important;
+        }
+        
+        button[kind="secondary"] {
+            background-color: #f3f4f6 !important;
+            border: 1px solid #d1d5db !important;
+            color: #1f2937 !important;
+            font-weight: 600 !important;
+        }
+        button[kind="secondary"]:hover {
+            background-color: #e5e7eb !important;
+            color: #111827 !important;
+        }
+
+        /* 背景・文字色の保険 */
+        [data-testid="stAppViewContainer"], .main {
+            background-color: #ffffff !important;
+            color: #111827 !important;
+        }
+
+        /* 画面幅が狭いときにst.columnsが縦積みに崩れないようにする */
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div {
+            width: 100% !important;
+            flex: 1 1 0 !important;
+            min-width: 0 !important;
+        }
+
+        /* 種目カードのセット表 */
+        .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
+        .ex-card-header { background: var(--brand-red); color: #fff; font-weight: 700;
+                           padding: 8px 12px; font-size: 0.95rem; }
+        .ex-set-row { display: grid; grid-template-columns: 0.5fr 1fr 1fr 1fr; padding: 6px 12px;
+                      font-size: 0.85rem; border-top: 1px solid #e5e7eb; color: #111827; }
+        .ex-set-row.head { font-weight: 700; color: #6b7280; font-size: 0.72rem; border-top: none; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def red_banner(text: str):
+    st.markdown(f'<div class="section-banner">{text}</div>', unsafe_allow_html=True)
 
 
 def main():
@@ -302,19 +393,49 @@ def main():
         workout_burn_row[0] if workout_burn_row[0] is not None else 0.0
     )
 
-    # アプリタイトル
-    st.title("FITNESS & NUTRITION TRACKER")
+    # アプリ全体の見た目(赤基調テーマ)
+    inject_theme_css()
 
-    # メイン画面のタブ切り替え（視認性向上のためst.tabsを採用）
-    tab1, tab2, tab3 = st.tabs(
-        ["今日の状態（ダッシュボード）", "食事記録", "筋トレ記録"]
+    # アプリタイトル(赤ヘッダーバナー)
+    st.markdown(
+        f"""
+        <div class="app-header">
+            <div class="app-title">FITNESS & NUTRITION TRACKER</div>
+            <div class="app-date">{today_str}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    # 画面切り替え
+    if "view" not in st.session_state:
+        st.session_state.view = "dashboard"
+
+    # 上部ナビゲーション
+    nav_items = [
+        ("dashboard", "ホーム"),
+        ("food", "食事記録"),
+        ("workout", "筋トレ記録"),
+    ]
+    nav_cols = st.columns(3)
+    for col, (view_key, label) in zip(nav_cols, nav_items):
+        is_active = st.session_state.view == view_key
+        with col:
+            if st.button(
+                label,
+                key=f"nav_{view_key}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.view = view_key
+                st.rerun()
+    st.divider()
+
     # --------------------------------------------------
-    # タブ1: 今日の状態（ダッシュボード）
+    # 画面1: 今日の状態（ダッシュボード）
     # --------------------------------------------------
-    with tab1:
-        st.header("今日の状態")
+    if st.session_state.view == "dashboard":
+        red_banner("今日の状態")
 
         offset_str = (
             f"+{offset}"
@@ -325,39 +446,87 @@ def main():
             f"現在の設定: {p_goal} | 推定維持カロリー(TDEE): {tdee} kcal | 調整幅: {offset_str} kcal"
         )
 
-        st.subheader("食事・目標管理")
+        red_banner("今日のカロリー状況")
         target_diff = target_cal - total_ingested_cal
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("目標摂取カロリー", f"{target_cal} kcal")
-        c2.metric("現在の摂取カロリー", f"{int(total_ingested_cal)} kcal")
-        c3.metric(
-            "目標まで",
-            f"{int(target_diff)} kcal"
-            if target_diff >= 0
-            else f"-{int(abs(target_diff))} kcal",
-        )
-
-        st.subheader("リアルエネルギー収支")
         net_balance = total_ingested_cal - (tdee + total_workout_burn)
 
-        c4, c5 = st.columns(2)
-        c4.metric("筋トレ推定消費", f"約 {int(total_workout_burn)} kcal")
-        c5.metric(
-            "推定エネルギー収支",
-            f"+{int(net_balance)} kcal"
-            if net_balance >= 0
-            else f"{int(net_balance)} kcal",
+        if offset < 0:
+            balance_class = "green" if net_balance <= 0 else "red"
+        elif offset > 0:
+            balance_class = "green" if net_balance >= 0 else "red"
+        else:
+            balance_class = "green" if abs(net_balance) <= 150 else "red"
+
+        target_diff_class = "green" if target_diff >= 0 else "red"
+        target_diff_str = (
+            f"{int(target_diff)}"
+            if target_diff >= 0
+            else f"-{int(abs(target_diff))}"
+        )
+        net_balance_str = (
+            f"+{int(net_balance)}" if net_balance >= 0 else f"{int(net_balance)}"
+        )
+
+        st.markdown(
+            """
+            <style>
+            .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 6px; }
+            .stat-card { background: #f8f9fa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; }
+            .stat-card.wide { grid-column: span 2; }
+            .stat-label { font-size: 0.72rem; color: #6b7280; margin-bottom: 4px; }
+            .stat-value { font-size: 1.3rem; font-weight: 700; color: #111827; line-height: 1.15; }
+            .stat-value.green { color: #16a34a; }
+            .stat-value.red { color: #dc2626; }
+            .stat-value.orange { color: #ea580c; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">目標摂取カロリー</div>
+                    <div class="stat-value">{target_cal} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">現在の摂取カロリー</div>
+                    <div class="stat-value">{int(total_ingested_cal)} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">目標まで</div>
+                    <div class="stat-value {target_diff_class}">{target_diff_str} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">筋トレ推定消費</div>
+                    <div class="stat-value orange">約 {int(total_workout_burn)} kcal</div>
+                </div>
+                <div class="stat-card wide">
+                    <div class="stat-label">実質エネルギー収支(摂取 − 消費)</div>
+                    <div class="stat-value {balance_class}">{net_balance_str} kcal</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         st.divider()
 
         # カレンダー表示
         now = datetime.date.today()
+        today_str_display = now.strftime("%Y-%m-%d")
         st.subheader(f"{now.year}年 {now.month}月")
 
+        month_start = f"{now.year}-{now.month:02d}-01"
+        next_month = now.month + 1 if now.month < 12 else 1
+        next_month_year = now.year if now.month < 12 else now.year + 1
+        month_end = f"{next_month_year}-{next_month:02d}-01"
+
         recorded_df = pd.read_sql_query(
-            "SELECT DISTINCT date FROM workout_logs", conn
+            "SELECT DISTINCT date FROM workout_logs WHERE date >= ? AND date < ?",
+            conn,
+            params=(month_start, month_end),
         )
         recorded_dates = (
             set(recorded_df["date"].tolist())
@@ -365,29 +534,102 @@ def main():
             else set()
         )
 
-        cols = st.columns(7)
-        days_abbr = ["日", "月", "火", "水", "木", "金", "土"]
-        for idx, col in enumerate(cols):
-            col.caption(f"**{days_abbr[idx]}**")
+        food_month_df = pd.read_sql_query(
+            "SELECT date, (breakfast_cal + lunch_cal + dinner_cal + snack_cal) AS total_cal "
+            "FROM food_logs WHERE date >= ? AND date < ?",
+            conn,
+            params=(month_start, month_end),
+        )
+        food_cal_by_date = (
+            dict(zip(food_month_df["date"], food_month_df["total_cal"]))
+            if not food_month_df.empty
+            else {}
+        )
 
+        st.markdown(
+            """
+            <style>
+            .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 6px; }
+            .cal-head { text-align: center; font-weight: 700; font-size: 0.8rem; color: #6b7280; padding-bottom: 2px; }
+            .cal-cell { border-radius: 10px; padding: 6px 4px 8px; min-height: 62px; background: #f8f9fa;
+                        border: 1px solid #e5e7eb; display: flex; flex-direction: column; align-items: center; }
+            .cal-cell.empty { background: transparent; border: none; }
+            .cal-cell.today { border: 2px solid var(--brand-red); }
+            .cal-day-num { font-weight: 700; font-size: 0.85rem; color: #111827; }
+            .cal-workout-dot { width: 7px; height: 7px; border-radius: 50%; background: #f97316; margin-top: 3px; }
+            .cal-no-dot { width: 7px; height: 7px; margin-top: 3px; }
+            .cal-cal-num { margin-top: 4px; font-size: 0.68rem; font-weight: 700; line-height: 1; }
+            .cal-cal-num.under { color: #16a34a; }
+            .cal-cal-num.over { color: #dc2626; }
+            .cal-cal-num.none { color: #9ca3af; }
+            .cal-legend { display: flex; gap: 16px; margin-top: 10px; font-size: 0.75rem; color: #6b7280; align-items: center; flex-wrap: wrap; }
+            .cal-legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #f97316; display: inline-block; margin-right: 4px; }
+            .cal-legend-num.under { color: #16a34a; font-weight: 700; }
+            .cal-legend-num.over { color: #dc2626; font-weight: 700; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        days_abbr = ["日", "月", "火", "水", "木", "金", "土"]
+        head_html = "".join(f'<div class="cal-head">{d}</div>' for d in days_abbr)
+
+        cells_html = ""
         month_cal = calendar.monthcalendar(now.year, now.month)
         for week in month_cal:
-            w_cols = st.columns(7)
-            for idx, day in enumerate(week):
+            for day in week:
                 if day == 0:
-                    w_cols[idx].write("")
+                    cells_html += '<div class="cal-cell empty"></div>'
+                    continue
+
+                date_str = f"{now.year}-{now.month:02d}-{day:02d}"
+                is_today = date_str == today_str_display
+                has_workout = date_str in recorded_dates
+                cal_total = food_cal_by_date.get(date_str)
+
+                today_class = " today" if is_today else ""
+                dot_html = (
+                    '<div class="cal-workout-dot"></div>'
+                    if has_workout
+                    else '<div class="cal-no-dot"></div>'
+                )
+
+                if cal_total is None:
+                    cal_html = '<div class="cal-cal-num none">-</div>'
+                elif cal_total <= target_cal:
+                    cal_html = f'<div class="cal-cal-num under">{int(cal_total)}</div>'
                 else:
-                    date_str = f"{now.year}-{now.month:02d}-{day:02d}"
-                    if date_str in recorded_dates:
-                        w_cols[idx].markdown(f"**[{day}]**")
-                    else:
-                        w_cols[idx].write(f"{day}")
+                    cal_html = f'<div class="cal-cal-num over">{int(cal_total)}</div>'
+
+                cells_html += (
+                    f'<div class="cal-cell{today_class}">'
+                    f'<div class="cal-day-num">{day}</div>'
+                    f'{dot_html}'
+                    f'{cal_html}'
+                    f'</div>'
+                )
+
+        st.markdown(
+            f'<div class="cal-grid">{head_html}{cells_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            """
+            <div class="cal-legend">
+                <span><span class="cal-legend-dot"></span>筋トレした日</span>
+                <span><span class="cal-legend-num under">数字</span> = 摂取カロリー(目標以内)</span>
+                <span><span class="cal-legend-num over">数字</span> = 摂取カロリー(目標オーバー)</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # --------------------------------------------------
-    # タブ2: 食事記録
+    # 画面2: 食事記録
     # --------------------------------------------------
-    with tab2:
-        st.header("食事カロリー入力")
+    elif st.session_state.view == "food":
+        red_banner("食事カロリー入力")
 
         food_date = st.date_input("記録日", value=datetime.date.today())
         f_date_str = food_date.strftime("%Y-%m-%d")
@@ -423,7 +665,7 @@ def main():
         sub_total = in_b + in_l + in_d + in_s
         st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
 
-        if st.button("食事記録を保存"):
+        if st.button("食事記録を保存", type="primary"):
             c.execute(
                 """
                 INSERT OR REPLACE INTO food_logs (date, breakfast_cal, lunch_cal, dinner_cal, snack_cal)
@@ -436,10 +678,32 @@ def main():
             st.rerun()
 
     # --------------------------------------------------
-    # タブ3: 筋トレ記録
+    # 画面3: 筋トレ記録
     # --------------------------------------------------
-    with tab3:
-        st.header("筋トレログ & 消費カロリー推定")
+    elif st.session_state.view == "workout":
+        red_banner("筋トレログ & 消費カロリー推定")
+
+        red_banner("① セッション全体の設定")
+        col_dur, col_int = st.columns(2)
+        with col_dur:
+            duration = st.number_input(
+                "全体実施時間 (分)", min_value=1, max_value=300, value=60, step=5
+            )
+        with col_int:
+            intensity = st.selectbox(
+                "運動強度",
+                [
+                    "標準 (通常のウェイトトレーニング)",
+                    "軽度 (ストレッチ/自重/休憩長め)",
+                    "高強度 (サーキット/高密度/スーパーセット)",
+                ],
+            )
+
+        estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
+        st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+
+        st.divider()
+        red_banner("② 種目の記録")
 
         col_date, col_part = st.columns(2)
         with col_date:
@@ -465,32 +729,14 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             weight_val = st.number_input(
-                "重量 (kg)", min_value=0.0, step=0.5, value=0.0
+                "重量 (kg)", min_value=0.0, step=0.5, value=40.0
             )
         with col2:
             reps_val = st.number_input(
-                "回数 (レップ)", min_value=0, step=1, value=0
+                "回数 (レップ)", min_value=0, step=1, value=10
             )
 
-        col_time, col_int = st.columns(2)
-        with col_time:
-            duration = st.number_input(
-                "実施時間 (分)", min_value=0, max_value=300, value=60, step=5
-            )
-        with col_int:
-            intensity = st.selectbox(
-                "運動強度",
-                [
-                    "標準 (通常のウェイトトレーニング)",
-                    "軽度 (ストレッチ/自重/休憩長め)",
-                    "高強度 (サーキット/高密度/スーパーセット)",
-                ],
-            )
-
-        estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
-        st.caption(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
-
-        if st.button("筋トレ記録を保存"):
+        if st.button("筋トレ記録を保存", type="primary"):
             if exercise != "（種目がありません）":
                 c.execute(
                     """
@@ -509,20 +755,41 @@ def main():
                     ),
                 )
                 conn.commit()
-                st.success("筋トレ記録を保存しました。")
+                st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
                 st.rerun()
 
         st.divider()
-        st.subheader("本日の筋トレ記録")
+        red_banner("本日の筋トレ記録")
         logs_df = pd.read_sql_query(
-            "SELECT id, part as 部位, exercise as 種目, weight as '重量(kg)', reps as 回数, duration_min as '時間(分)', burned_calories as '消費(kcal)' FROM workout_logs WHERE date = ?",
+            "SELECT id, exercise, weight, reps FROM workout_logs "
+            "WHERE date = ? ORDER BY id",
             conn,
             params=(w_date_str,),
         )
         if not logs_df.empty:
-            st.dataframe(
-                logs_df.drop(columns=["id"]), use_container_width=True
-            )
+            cards_html = ""
+            for exercise_name, group in logs_df.groupby("exercise", sort=False):
+                rows_html = (
+                    '<div class="ex-set-row head">'
+                    "<div>セット</div><div>重さ</div><div>回数</div><div>RM</div></div>"
+                )
+                for set_no, (_, row) in enumerate(group.iterrows(), start=1):
+                    estimated_rm = row["weight"] * (1 + 0.025 * row["reps"])
+                    rows_html += (
+                        '<div class="ex-set-row">'
+                        f"<div>{set_no}</div>"
+                        f"<div>{row['weight']:g} kg</div>"
+                        f"<div>{int(row['reps'])} 回</div>"
+                        f"<div>{estimated_rm:.1f} kg</div>"
+                        "</div>"
+                    )
+                cards_html += (
+                    '<div class="ex-card">'
+                    f'<div class="ex-card-header">{exercise_name}</div>'
+                    f"{rows_html}"
+                    "</div>"
+                )
+            st.markdown(cards_html, unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
 
