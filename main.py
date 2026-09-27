@@ -148,6 +148,8 @@ def analyze_food_image(image: Image.Image, api_key: str):
         text = response.text.strip()
         if text.startswith("```json"):
             text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
@@ -216,31 +218,78 @@ def inject_theme_css():
             --brand-red-dark: #c92a3d;
         }
 
+        /* 画面全体・背景・基本文字色の強制標準化 (ライトモード固定) */
+        html, body, [data-testid="stAppViewContainer"], .main, [data-testid="stHeader"] {
+            background-color: #ffffff !important;
+            color: #111827 !important;
+        }
+
+        /* Streamlitの各種テキスト・ラベル・ヘッダー・キャプションの文字色を黒に固定 */
+        p, span, label, h1, h2, h3, h4, h5, h6,
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stWidgetLabel"],
+        [data-testid="stCaptionContainer"],
+        .stSelectbox label, .stNumberInput label, .stDateInput label {
+            color: #111827 !important;
+        }
+
+        /* 入力ボックス (NumberInput, Selectbox, DateInput, TextInput) の背景と文字色 */
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="select"] > div,
+        input {
+            background-color: #f9fafb !important;
+            color: #111827 !important;
+            border-color: #d1d5db !important;
+        }
+
+        /* 数値入力(+ -)ボタン等の調整 */
+        button[aria-label="Increase value"], button[aria-label="Decrease value"] {
+            background-color: #e5e7eb !important;
+            color: #111827 !important;
+        }
+
+        /* タブ (st.tabs) の非選択・選択時の文字色 */
+        button[data-baseweb="tab"] {
+            color: #4b5563 !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: var(--brand-red) !important;
+            border-bottom-color: var(--brand-red) !important;
+        }
+
+        /* バナー＆ヘッダー */
         .section-banner {
             background: var(--brand-red);
-            color: #ffffff;
+            color: #ffffff !important;
             font-weight: 700;
             font-size: 1.05rem;
             padding: 10px 14px;
             border-radius: 10px;
             margin: 18px 0 10px;
         }
+        .section-banner * {
+            color: #ffffff !important;
+        }
 
         .app-header {
             background: var(--brand-red);
-            color: #ffffff;
+            color: #ffffff !important;
             border-radius: 12px;
             padding: 14px 16px;
             margin-bottom: 14px;
         }
-        .app-header .app-title { font-size: 1.15rem; font-weight: 800; }
-        .app-header .app-date { font-size: 0.8rem; opacity: 0.9; margin-top: 2px; }
+        .app-header .app-title { font-size: 1.15rem; font-weight: 800; color: #ffffff !important; }
+        .app-header .app-date { font-size: 0.8rem; opacity: 0.9; margin-top: 2px; color: #ffffff !important; }
 
+        /* ボタンデザイン */
         button[kind="primary"] {
             background-color: var(--brand-red) !important;
             border-color: var(--brand-red) !important;
             color: #ffffff !important;
             font-weight: 700 !important;
+        }
+        button[kind="primary"] p {
+            color: #ffffff !important;
         }
         button[kind="primary"]:hover {
             background-color: var(--brand-red-dark) !important;
@@ -253,24 +302,17 @@ def inject_theme_css():
             color: #1f2937 !important;
             font-weight: 600 !important;
         }
+        button[kind="secondary"] p {
+            color: #1f2937 !important;
+        }
         button[kind="secondary"]:hover {
             background-color: #e5e7eb !important;
             color: #111827 !important;
         }
 
-        [data-testid="stAppViewContainer"], .main {
-            background-color: #ffffff !important;
-            color: #111827 !important;
-        }
-
+        /* 横並びブロックの崩れ防止 */
         div[data-testid="stHorizontalBlock"] {
-            flex-direction: row !important;
-            flex-wrap: nowrap !important;
-        }
-        div[data-testid="stHorizontalBlock"] > div {
-            width: 100% !important;
-            flex: 1 1 0 !important;
-            min-width: 0 !important;
+            flex-wrap: wrap !important;
         }
 
         .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
@@ -694,17 +736,15 @@ def main():
             (f_date_str,),
         ).fetchone()
 
-        # Session Stateの初期化
-        if "ai_b" not in st.session_state:
+        # 日付変更時に session_state を正しく同期する制御
+        if "last_food_date" not in st.session_state or st.session_state.last_food_date != f_date_str:
+            st.session_state.last_food_date = f_date_str
             st.session_state.ai_b = f_row[0] if f_row else 0.0
-        if "ai_l" not in st.session_state:
             st.session_state.ai_l = f_row[1] if f_row else 0.0
-        if "ai_d" not in st.session_state:
             st.session_state.ai_d = f_row[2] if f_row else 0.0
-        if "ai_s" not in st.session_state:
             st.session_state.ai_s = f_row[3] if f_row else 0.0
 
-        tab1, tab2 = st.tabs(["手入力", "📸 AIカメラ/写真解析"])
+        tab1, tab2 = st.tabs(["手入力", "AIカメラ/写真解析"])
 
         with tab2:
             st.markdown("#### 写真からカロリーを推定")
@@ -775,6 +815,7 @@ def main():
                     min_value=0.0,
                     value=float(st.session_state.ai_b),
                     step=50.0,
+                    key="input_b",
                 )
             with col_l:
                 in_l = st.number_input(
@@ -782,6 +823,7 @@ def main():
                     min_value=0.0,
                     value=float(st.session_state.ai_l),
                     step=50.0,
+                    key="input_l",
                 )
             with col_d:
                 in_d = st.number_input(
@@ -789,6 +831,7 @@ def main():
                     min_value=0.0,
                     value=float(st.session_state.ai_d),
                     step=50.0,
+                    key="input_d",
                 )
             with col_s:
                 in_s = st.number_input(
@@ -796,7 +839,14 @@ def main():
                     min_value=0.0,
                     value=float(st.session_state.ai_s),
                     step=50.0,
+                    key="input_s",
                 )
+
+            # session_state の更新
+            st.session_state.ai_b = in_b
+            st.session_state.ai_l = in_l
+            st.session_state.ai_d = in_d
+            st.session_state.ai_s = in_s
 
             sub_total = in_b + in_l + in_d + in_s
             st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
@@ -928,6 +978,9 @@ def main():
             st.markdown(cards_html, unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
+
+    # DBコネクションのクローズ処理
+    conn.close()
 
 
 if __name__ == "__main__":
