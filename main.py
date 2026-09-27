@@ -17,6 +17,7 @@ st.set_page_config(
 # --------------------------------------------------
 # データベース初期化
 # --------------------------------------------------
+
 def init_db():
     conn = sqlite3.connect("workout.db", check_same_thread=False)
     c = conn.cursor()
@@ -102,7 +103,8 @@ def init_db():
         ("脚", "インナーサイ"),
     ]
 
-
+    # 既存の種目を一旦クリアして最新リストに更新する
+    c.execute("DELETE FROM exercises")
     c.executemany(
         "INSERT OR IGNORE INTO exercises (part, name) VALUES (?, ?)",
         default_exercises,
