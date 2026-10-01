@@ -1,7 +1,11 @@
 import calendar
 import datetime
+import json
+import os
 import pandas as pd
+from PIL import Image
 import streamlit as st
+from google import genai
 from supabase import create_client, Client
 
 # --------------------------------------------------
@@ -14,56 +18,54 @@ st.set_page_config(
 )
 
 # --------------------------------------------------
-# Supabase クライアント初期化
+# Supabase 接続初期化
 # --------------------------------------------------
 @st.cache_resource
 def init_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    # Streamlit Secrets から Supabase URL と Key を取得
+    url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
+    
+    if not url or not key:
+        st.error("Supabaseの接続情報（SUPABASE_URL, SUPABASE_KEY）が見つかりません。")
+        st.stop()
     return create_client(url, key)
 
 supabase = init_supabase()
 
-# デフォルト種目の初期登録処理
-def init_default_exercises():
-    default_exercises = [
-        ("胸", "ベンチプレス"),
-        ("胸", "インクラインダンベルプレス"),
-        ("胸", "ダンベルプレス"),
-        ("胸", "スミスインクラインベンチプレス"),
-        ("胸", "チェストプレス"),
-        ("胸", "ペックフライ"),
-        ("胸", "ケーブルフライ"),
-        ("二頭", "インクラインダンベルカール"),
-        ("二頭", "ダンベルハンマーカール"),
-        ("二頭", "ケーブルカール"),
-        ("二頭", "プリチャーハンマーカール"),
-        ("三頭", "フレンチプレス"),
-        ("三頭", "ケーブルプレスダウン"),
-        ("背中", "チンニング"),
-        ("背中", "ベントオーバーローイング"),
-        ("背中", "ワンハンドローイング"),
-        ("背中", "ラットプルダウン"),
-        ("背中", "シーテッドローイング"),
-        ("肩", "ダンベルショルダープレス"),
-        ("肩", "スミスショルダープレス"),
-        ("肩", "サイドレイズ"),
-        ("肩", "インクラインサイドレイズ"),
-        ("肩", "ケーブルフェイスプル"),
-        ("肩", "ケーブルフロントレイズ"),
-        ("脚", "スクワット"),
-        ("脚", "45度レッグプレス"),
-        ("脚", "レッグプレス"),
-        ("脚", "ブルガリアンスクワット"),
-        ("脚", "レッグエクステンション"),
-        ("脚", "レッグカール"),
-        ("脚", "インナーサイ"),
-    ]
-    for part, name in default_exercises:
-        try:
-            supabase.table("exercises").insert({"part": part, "name": name}).execute()
-        except Exception:
-            pass  # 登録済みならスキップ
+# --------------------------------------------------
+# Gemini AIによる画像解析関数
+# --------------------------------------------------
+def analyze_food_image(image: Image.Image, api_key: str):
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = """
+        添付された食事の画像を解析し、おおよそのカロリー（kcal）と料理の名称・内訳を推定してください。
+        回答は必ず以下の純粋なJSONフォーマットのみで出力してください（Markdownのバッククォートや装飾は不要です）。
+
+        {
+            "dish_name": "推定される料理名や内容",
+            "total_calories": 推定合計カロリー(数値のみ),
+            "meal_type": "朝食", "昼食", "夕食", "間食" のいずれか最も可能性が高いもの,
+            "description": "内訳や理由の短い補足コメント"
+        }
+        """
+        response = client.models.generate_content(
+            model="gemini-1.5-flash", contents=[image, prompt]
+        )
+
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        return json.loads(text), None
+    except Exception as e:
+        return None, str(e)
 
 # BMR / TDEE / 目標カロリー計算
 def calculate_nutrition_targets(
@@ -100,8 +102,8 @@ def calculate_nutrition_targets(
 # METs計算
 def calculate_workout_burn(weight, duration_min, intensity):
     mets_map = {
-        "軽度 (ストレッチ/自重/休憩長め)": 3.5,
         "標準 (通常のウェイトトレーニング)": 6.0,
+        "軽度 (ストレッチ/自重/休憩長め)": 3.5,
         "高強度 (サーキット/高密度/スーパーセット)": 8.0,
     }
     mets = mets_map.get(intensity, 6.0)
@@ -110,42 +112,124 @@ def calculate_workout_burn(weight, duration_min, intensity):
     burn = (mets - 1.0) * weight * (duration_min / 60.0) * 1.05
     return round(burn, 1)
 
-def main():
-    if "user" not in st.session_state:
-        st.session_state.user = None
+# --------------------------------------------------
+# UI用CSS
+# --------------------------------------------------
+def inject_theme_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --brand-red: #e63946;
+            --brand-red-dark: #c92a3d;
+        }
 
-    # --- 1. 未ログイン時：ログイン / 新規登録画面 ---
-    if st.session_state.user is None:
-        st.title("FITNESS & NUTRITION TRACKER")
-        auth_mode = st.radio("機能を選択", ["ログイン", "新規アカウント登録"], horizontal=True)
+        html, body, [data-testid="stAppViewContainer"], .main, [data-testid="stHeader"] {
+            background-color: #ffffff !important;
+            color: #111827 !important;
+        }
+
+        p, span, label, h1, h2, h3, h4, h5, h6,
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stWidgetLabel"],
+        [data-testid="stCaptionContainer"],
+        .stSelectbox label, .stNumberInput label, .stDateInput label {
+            color: #111827 !important;
+        }
+
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="select"] > div,
+        input {
+            background-color: #f9fafb !important;
+            color: #111827 !important;
+            border-color: #d1d5db !important;
+        }
+
+        button[aria-label="Increase value"], button[aria-label="Decrease value"] {
+            background-color: #e5e7eb !important;
+            color: #111827 !important;
+        }
+
+        button[data-baseweb="tab"] {
+            color: #4b5563 !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: var(--brand-red) !important;
+            border-bottom-color: var(--brand-red) !important;
+        }
+
+        .section-banner {
+            background: var(--brand-red);
+            color: #ffffff !important;
+            font-weight: 700;
+            font-size: 1.05rem;
+            padding: 10px 14px;
+            border-radius: 10px;
+            margin: 18px 0 10px;
+        }
+        .section-banner * {
+            color: #ffffff !important;
+        }
+
+        .app-header {
+            background: var(--brand-red);
+            color: #ffffff !important;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+        }
+        .app-header .app-title { font-size: 1.15rem; font-weight: 800; color: #ffffff !important; }
+        .app-header .app-date { font-size: 0.8rem; opacity: 0.9; margin-top: 2px; color: #ffffff !important; }
+
+        button[kind="primary"] {
+            background-color: var(--brand-red) !important;
+            border-color: var(--brand-red) !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+        button[kind="primary"] p {
+            color: #ffffff !important;
+        }
+        button[kind="primary"]:hover {
+            background-color: var(--brand-red-dark) !important;
+            border-color: var(--brand-red-dark) !important;
+        }
         
-        email = st.text_input("メールアドレス")
-        password = st.text_input("パスワード", type="password")
+        button[kind="secondary"] {
+            background-color: #f3f4f6 !important;
+            border: 1px solid #d1d5db !important;
+            color: #1f2937 !important;
+            font-weight: 600 !important;
+        }
+        button[kind="secondary"] p {
+            color: #1f2937 !important;
+        }
+        button[kind="secondary"]:hover {
+            background-color: #e5e7eb !important;
+            color: #111827 !important;
+        }
 
-        if auth_mode == "新規アカウント登録":
-            if st.button("アカウント作成"):
-                try:
-                    res = supabase.auth.sign_up({"email": email, "password": password})
-                    st.success("アカウントが作成されました！ログインしてください。")
-                except Exception as e:
-                    st.error(f"登録エラー: {e}")
-        else:
-            if st.button("ログイン"):
-                try:
-                    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-                    st.session_state.user = res.user
-                    init_default_exercises()
-                    st.success("ログインに成功しました！")
-                    st.rerun()
-                except Exception as e:
-                    st.error("ログインエラー: メールアドレスまたはパスワードを確認してください。")
-        return
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+        }
 
-    # --- 2. ログイン後：メインアプリ画面 ---
-    user_id = st.session_state.user.id
+        .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
+        .ex-card-header { background: var(--brand-red); color: #fff; font-weight: 700;
+                           padding: 8px 12px; font-size: 0.95rem; }
+        .ex-set-row { display: grid; grid-template-columns: 0.5fr 1fr 1fr 1fr; padding: 6px 12px;
+                      font-size: 0.85rem; border-top: 1px solid #e5e7eb; color: #111827; }
+        .ex-set-row.head { font-weight: 700; color: #6b7280; font-size: 0.72rem; border-top: none; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # プロフィール取得
-    res = supabase.table("user_profile").select("*").eq("user_id", user_id).execute()
+def red_banner(text: str):
+    st.markdown(f'<div class="section-banner">{text}</div>', unsafe_allow_html=True)
+
+def main():
+    # Supabaseからユーザープロフィールを取得
+    res = supabase.table("user_profile").select("*").eq("id", 1).execute()
     profile = res.data[0] if res.data else None
 
     if profile:
@@ -156,40 +240,32 @@ def main():
         p_act = profile.get("activity_level", "週3〜4回運動")
         p_steps = profile.get("steps", 8000)
         p_goal = profile.get("goal_phase", "標準増量 (+300 kcal)")
+        p_api_key = profile.get("api_key", "")
     else:
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal = (
-            "男性", 25, 170.0, 65.0, "週3〜4回運動", 8000, "標準増量 (+300 kcal)"
+        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal, p_api_key = (
+            "男性", 25, 170.0, 65.0, "週3〜4回運動", 8000, "標準増量 (+300 kcal)", ""
         )
 
     # サイドバー：設定
     st.sidebar.title("ユーザー設定")
-    st.sidebar.caption(f"ログイン中: {st.session_state.user.email}")
-    if st.sidebar.button("ログアウト"):
-        supabase.auth.sign_out()
-        st.session_state.user = None
-        st.rerun()
-
-    st.sidebar.divider()
     with st.sidebar.form("profile_form"):
-        gender = st.selectbox(
-            "性別",
-            ["男性", "女性"],
-            index=0 if p_gender == "男性" else 1,
+        api_key_input = st.text_input(
+            "Gemini API Key",
+            value=p_api_key if p_api_key else "",
+            type="password",
+            help="Google AI Studioで取得したAPIキーを入力してください",
         )
+        gender = st.selectbox("性別", ["男性", "女性"], index=0 if p_gender == "男性" else 1)
         age = st.number_input("年齢", min_value=10, max_value=100, value=int(p_age))
-        height = st.number_input(
-            "身長 (cm)", min_value=100.0, max_value=230.0, value=float(p_height)
-        )
-        weight = st.number_input(
-            "体重 (kg)", min_value=30.0, max_value=200.0, value=float(p_weight)
-        )
+        height = st.number_input("身長 (cm)", min_value=100.0, max_value=230.0, value=float(p_height))
+        weight = st.number_input("体重 (kg)", min_value=30.0, max_value=200.0, value=float(p_weight))
+        
         act_options = ["デスクワーク中心", "週1〜2回運動", "週3〜4回運動", "週5回以上運動"]
         act_index = act_options.index(p_act) if p_act in act_options else 2
         act_level = st.selectbox("日常活動レベル", act_options, index=act_index)
         
-        steps = st.number_input(
-            "1日の平均歩数", min_value=0, max_value=50000, value=int(p_steps), step=500
-        )
+        steps = st.number_input("1日の平均歩数", min_value=0, max_value=50000, value=int(p_steps), step=500)
+        
         goal_options = [
             "積極的減量 (-500 kcal)",
             "標準減量 (-400 kcal)",
@@ -202,8 +278,8 @@ def main():
         goal_phase = st.selectbox("現在の目的", goal_options, index=goal_index)
 
         if st.form_submit_button("設定を保存"):
-            data = {
-                "user_id": user_id,
+            profile_data = {
+                "id": 1,
                 "gender": gender,
                 "age": age,
                 "height": height,
@@ -211,18 +287,16 @@ def main():
                 "activity_level": act_level,
                 "steps": steps,
                 "goal_phase": goal_phase,
-                "updated_at": "now()",
+                "api_key": api_key_input.strip(),
             }
-            supabase.table("user_profile").upsert(data).execute()
+            supabase.table("user_profile").upsert(profile_data).execute()
             st.sidebar.success("設定を更新しました。")
             st.rerun()
 
     # 種目追加
     st.sidebar.divider()
     st.sidebar.title("種目追加")
-    new_part = st.sidebar.selectbox(
-        "部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"]
-    )
+    new_part = st.sidebar.selectbox("部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"])
     new_ex = st.sidebar.text_input("種目名")
     if st.sidebar.button("種目を追加"):
         if new_ex.strip() != "":
@@ -231,190 +305,335 @@ def main():
                 st.sidebar.success(f"「{new_ex}」を追加しました。")
                 st.rerun()
             except Exception:
-                st.sidebar.warning("既に登録されています。")
+                st.sidebar.warning("既に登録されているか、エラーが発生しました。")
 
     # 計算実行
     bmr, tdee, target_cal, offset = calculate_nutrition_targets(
         p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal
     )
 
-    # 今日のデータ取得
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-    food_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", today_str).execute()
-    food_data = food_res.data[0] if food_res.data else {}
+    # 今日の食事記録を取得
+    food_res = supabase.table("food_logs").select("*").eq("date", today_str).execute()
+    food_row = food_res.data[0] if food_res.data else None
     total_ingested_cal = (
-        food_data.get("breakfast_cal", 0) +
-        food_data.get("lunch_cal", 0) +
-        food_data.get("dinner_cal", 0) +
-        food_data.get("snack_cal", 0)
+        (food_row.get("breakfast_cal", 0) or 0) +
+        (food_row.get("lunch_cal", 0) or 0) +
+        (food_row.get("dinner_cal", 0) or 0) +
+        (food_row.get("snack_cal", 0) or 0)
+    ) if food_row else 0.0
+
+    # 今日の筋トレ消費カロリーを取得
+    workout_res = supabase.table("workout_logs").select("burned_calories").eq("date", today_str).execute()
+    total_workout_burn = sum([item.get("burned_calories", 0) or 0 for item in workout_res.data]) if workout_res.data else 0.0
+
+    inject_theme_css()
+
+    st.markdown(
+        f"""
+        <div class="app-header">
+            <div class="app-title">FITNESS & NUTRITION TRACKER</div>
+            <div class="app-date">{today_str}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    workout_res = supabase.table("workout_logs").select("burned_calories").eq("user_id", user_id).eq("date", today_str).execute()
-    total_workout_burn = sum(item["burned_calories"] for item in workout_res.data if item.get("burned_calories"))
+    if "view" not in st.session_state:
+        st.session_state.view = "dashboard"
 
-    # アプリタイトル
-    st.title("FITNESS & NUTRITION TRACKER")
-
-    # メイン画面のタブ切り替え
-    tab1, tab2, tab3 = st.tabs(
-        ["今日の状態（ダッシュボード）", "食事記録", "筋トレ記録"]
-    )
+    nav_items = [
+        ("dashboard", "ホーム"),
+        ("food", "食事記録"),
+        ("workout", "筋トレ記録"),
+    ]
+    nav_cols = st.columns(3)
+    for col, (view_key, label) in zip(nav_cols, nav_items):
+        is_active = st.session_state.view == view_key
+        with col:
+            if st.button(
+                label,
+                key=f"nav_{view_key}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.view = view_key
+                st.rerun()
+    st.divider()
 
     # --------------------------------------------------
-    # タブ1: 今日の状態（ダッシュボード）
+    # 画面1: ホーム
     # --------------------------------------------------
-    with tab1:
-        st.header("今日の状態")
+    if st.session_state.view == "dashboard":
+        red_banner("今日の状態")
 
-        offset_str = (
-            f"+{offset}"
-            if offset > 0
-            else (f"{offset}" if offset < 0 else "±0")
-        )
-        st.info(
-            f"現在の設定: {p_goal} | 推定維持カロリー(TDEE): {tdee} kcal | 調整幅: {offset_str} kcal"
-        )
+        offset_str = f"+{offset}" if offset > 0 else (f"{offset}" if offset < 0 else "±0")
+        st.info(f"現在の設定: {p_goal} | 推定維持カロリー(TDEE): {tdee} kcal | 調整幅: {offset_str} kcal")
 
-        st.subheader("食事・目標管理")
+        red_banner("今日のカロリー状況")
         target_diff = target_cal - total_ingested_cal
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("目標摂取カロリー", f"{target_cal} kcal")
-        c2.metric("現在の摂取カロリー", f"{int(total_ingested_cal)} kcal")
-        c3.metric(
-            "目標まで",
-            f"{int(target_diff)} kcal"
-            if target_diff >= 0
-            else f"-{int(abs(target_diff))} kcal",
-        )
-
-        st.subheader("リアルエネルギー収支")
         net_balance = total_ingested_cal - (tdee + total_workout_burn)
 
-        c4, c5 = st.columns(2)
-        c4.metric("筋トレ推定消費", f"約 {int(total_workout_burn)} kcal")
-        c5.metric(
-            "推定エネルギー収支",
-            f"+{int(net_balance)} kcal"
-            if net_balance >= 0
-            else f"{int(net_balance)} kcal",
+        if offset < 0:
+            balance_class = "green" if net_balance <= 0 else "red"
+        elif offset > 0:
+            balance_class = "green" if net_balance >= 0 else "red"
+        else:
+            balance_class = "green" if abs(net_balance) <= 150 else "red"
+
+        target_diff_class = "green" if target_diff >= 0 else "red"
+        target_diff_str = f"{int(target_diff)}" if target_diff >= 0 else f"-{int(abs(target_diff))}"
+        net_balance_str = f"+{int(net_balance)}" if net_balance >= 0 else f"{int(net_balance)}"
+
+        st.markdown(
+            """
+            <style>
+            .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 6px; }
+            .stat-card { background: #f8f9fa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; }
+            .stat-card.wide { grid-column: span 2; }
+            .stat-label { font-size: 0.72rem; color: #6b7280; margin-bottom: 4px; }
+            .stat-value { font-size: 1.3rem; font-weight: 700; color: #111827; line-height: 1.15; }
+            .stat-value.green { color: #16a34a; }
+            .stat-value.red { color: #dc2626; }
+            .stat-value.orange { color: #ea580c; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">目標摂取カロリー</div>
+                    <div class="stat-value">{target_cal} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">現在の摂取カロリー</div>
+                    <div class="stat-value">{int(total_ingested_cal)} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">目標まで</div>
+                    <div class="stat-value {target_diff_class}">{target_diff_str} kcal</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">筋トレ推定消費</div>
+                    <div class="stat-value orange">約 {int(total_workout_burn)} kcal</div>
+                </div>
+                <div class="stat-card wide">
+                    <div class="stat-label">実質エネルギー収支(摂取 − 消費)</div>
+                    <div class="stat-value {balance_class}">{net_balance_str} kcal</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         st.divider()
 
-        # カレンダー表示
         now = datetime.date.today()
+        today_str_display = now.strftime("%Y-%m-%d")
         st.subheader(f"{now.year}年 {now.month}月")
 
-        recorded_res = supabase.table("workout_logs").select("date").eq("user_id", user_id).execute()
-        recorded_dates = {item["date"] for item in recorded_res.data} if recorded_res.data else set()
+        month_start = f"{now.year}-{now.month:02d}-01"
+        next_month = now.month + 1 if now.month < 12 else 1
+        next_month_year = now.year if now.month < 12 else now.year + 1
+        month_end = f"{next_month_year}-{next_month:02d}-01"
 
-        cols = st.columns(7)
+        # 当月の筋トレログと食事ログを取得
+        w_month_res = supabase.table("workout_logs").select("date").gte("date", month_start).lt("date", month_end).execute()
+        recorded_dates = set([r["date"] for r in w_month_res.data]) if w_month_res.data else set()
+
+        f_month_res = supabase.table("food_logs").select("date, breakfast_cal, lunch_cal, dinner_cal, snack_cal").gte("date", month_start).lt("date", month_end).execute()
+        food_cal_by_date = {}
+        if f_month_res.data:
+            for r in f_month_res.data:
+                tot = (r.get("breakfast_cal") or 0) + (r.get("lunch_cal") or 0) + (r.get("dinner_cal") or 0) + (r.get("snack_cal") or 0)
+                food_cal_by_date[r["date"]] = tot
+
+        st.markdown(
+            """
+            <style>
+            .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 6px; }
+            .cal-head { text-align: center; font-weight: 700; font-size: 0.8rem; color: #6b7280; padding-bottom: 2px; }
+            .cal-cell { border-radius: 10px; padding: 6px 4px 8px; min-height: 62px; background: #f8f9fa;
+                        border: 1px solid #e5e7eb; display: flex; flex-direction: column; align-items: center; }
+            .cal-cell.empty { background: transparent; border: none; }
+            .cal-cell.today { border: 2px solid var(--brand-red); }
+            .cal-day-num { font-weight: 700; font-size: 0.85rem; color: #111827; }
+            .cal-workout-dot { width: 7px; height: 7px; border-radius: 50%; background: #f97316; margin-top: 3px; }
+            .cal-no-dot { width: 7px; height: 7px; margin-top: 3px; }
+            .cal-cal-num { margin-top: 4px; font-size: 0.68rem; font-weight: 700; line-height: 1; }
+            .cal-cal-num.under { color: #16a34a; }
+            .cal-cal-num.over { color: #dc2626; }
+            .cal-cal-num.none { color: #9ca3af; }
+            .cal-legend { display: flex; gap: 16px; margin-top: 10px; font-size: 0.75rem; color: #6b7280; align-items: center; flex-wrap: wrap; }
+            .cal-legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #f97316; display: inline-block; margin-right: 4px; }
+            .cal-legend-num.under { color: #16a34a; font-weight: 700; }
+            .cal-legend-num.over { color: #dc2626; font-weight: 700; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
         days_abbr = ["日", "月", "火", "水", "木", "金", "土"]
-        for idx, col in enumerate(cols):
-            col.caption(f"**{days_abbr[idx]}**")
+        head_html = "".join(f'<div class="cal-head">{d}</div>' for d in days_abbr)
 
+        cells_html = ""
         month_cal = calendar.monthcalendar(now.year, now.month)
         for week in month_cal:
-            w_cols = st.columns(7)
-            for idx, day in enumerate(week):
+            for day in week:
                 if day == 0:
-                    w_cols[idx].write("")
+                    cells_html += '<div class="cal-cell empty"></div>'
+                    continue
+
+                date_str = f"{now.year}-{now.month:02d}-{day:02d}"
+                is_today = date_str == today_str_display
+                has_workout = date_str in recorded_dates
+                cal_total = food_cal_by_date.get(date_str)
+
+                today_class = " today" if is_today else ""
+                dot_html = '<div class="cal-workout-dot"></div>' if has_workout else '<div class="cal-no-dot"></div>'
+
+                if cal_total is None:
+                    cal_html = '<div class="cal-cal-num none">-</div>'
+                elif cal_total <= target_cal:
+                    cal_html = f'<div class="cal-cal-num under">{int(cal_total)}</div>'
                 else:
-                    date_str = f"{now.year}-{now.month:02d}-{day:02d}"
-                    if date_str in recorded_dates:
-                        w_cols[idx].markdown(f"**[{day}]**")
-                    else:
-                        w_cols[idx].write(f"{day}")
+                    cal_html = f'<div class="cal-cal-num over">{int(cal_total)}</div>'
+
+                cells_html += (
+                    f'<div class="cal-cell{today_class}">'
+                    f'<div class="cal-day-num">{day}</div>'
+                    f'{dot_html}'
+                    f'{cal_html}'
+                    f'</div>'
+                )
+
+        st.markdown(f'<div class="cal-grid">{head_html}{cells_html}</div>', unsafe_allow_html=True)
+
+        st.markdown(
+            """
+            <div class="cal-legend">
+                <span><span class="cal-legend-dot"></span>筋トレした日</span>
+                <span><span class="cal-legend-num under">数字</span> = 摂取カロリー(目標以内)</span>
+                <span><span class="cal-legend-num over">数字</span> = 摂取カロリー(目標オーバー)</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # --------------------------------------------------
-    # タブ2: 食事記録
+    # 画面2: 食事記録（AIカメラ機能付き）
     # --------------------------------------------------
-    with tab2:
-        st.header("食事カロリー入力")
+    elif st.session_state.view == "food":
+        red_banner("食事カロリー入力")
 
         food_date = st.date_input("記録日", value=datetime.date.today())
         f_date_str = food_date.strftime("%Y-%m-%d")
 
-        f_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", f_date_str).execute()
-        f_row = f_res.data[0] if f_res.data else {}
+        f_res = supabase.table("food_logs").select("*").eq("date", f_date_str).execute()
+        f_row = f_res.data[0] if f_res.data else None
 
-        init_b = f_row.get("breakfast_cal", 0.0)
-        init_l = f_row.get("lunch_cal", 0.0)
-        init_d = f_row.get("dinner_cal", 0.0)
-        init_s = f_row.get("snack_cal", 0.0)
+        if "last_food_date" not in st.session_state or st.session_state.last_food_date != f_date_str:
+            st.session_state.last_food_date = f_date_str
+            st.session_state.ai_b = f_row.get("breakfast_cal", 0.0) if f_row else 0.0
+            st.session_state.ai_l = f_row.get("lunch_cal", 0.0) if f_row else 0.0
+            st.session_state.ai_d = f_row.get("dinner_cal", 0.0) if f_row else 0.0
+            st.session_state.ai_s = f_row.get("snack_cal", 0.0) if f_row else 0.0
 
-        col_b, col_l, col_d, col_s = st.columns(4)
-        with col_b:
-            in_b = st.number_input(
-                "朝食 (kcal)", min_value=0.0, value=float(init_b), step=50.0
-            )
-        with col_l:
-            in_l = st.number_input(
-                "昼食 (kcal)", min_value=0.0, value=float(init_l), step=50.0
-            )
-        with col_d:
-            in_d = st.number_input(
-                "夕食 (kcal)", min_value=0.0, value=float(init_d), step=50.0
-            )
-        with col_s:
-            in_s = st.number_input(
-                "間食 (kcal)", min_value=0.0, value=float(init_s), step=50.0
-            )
+        tab1, tab2 = st.tabs(["手入力", "AIカメラ/写真解析"])
 
-        sub_total = in_b + in_l + in_d + in_s
-        st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
+        with tab2:
+            st.markdown("#### 写真からカロリーを推定")
+            if not p_api_key:
+                st.warning("左側のサイドバーメニュー（ユーザー設定）に Gemini API キーを入力してください。")
+            else:
+                img_source = st.radio("入力方法", ["カメラ撮影", "画像ファイル選択"], horizontal=True)
+                uploaded_img = None
 
-        if st.button("食事記録を保存"):
-            data = {
-                "user_id": user_id,
-                "date": f_date_str,
-                "breakfast_cal": in_b,
-                "lunch_cal": in_l,
-                "dinner_cal": in_d,
-                "snack_cal": in_s,
-            }
-            supabase.table("food_logs").upsert(data, on_conflict="user_id,date").execute()
-            st.success("食事記録を保存しました。")
-            st.rerun()
+                if img_source == "カメラ撮影":
+                    uploaded_img = st.camera_input("料理を撮影してください")
+                else:
+                    uploaded_img = st.file_uploader("画像を選択してください", type=["jpg", "jpeg", "png", "webp"])
+
+                if uploaded_img is not None:
+                    image = Image.open(uploaded_img)
+                    st.image(image, caption="解析対象の画像", use_container_width=True)
+
+                    if st.button("AIでカロリーを判定", type="primary"):
+                        with st.spinner("AIが食事内容とカロリーを解析中..."):
+                            result, error = analyze_food_image(image, p_api_key)
+                            if error:
+                                st.error(f"解析エラー: {error}")
+                            else:
+                                st.session_state.ai_result = result
+
+                if "ai_result" in st.session_state:
+                    res = st.session_state.ai_result
+                    st.success("解析が完了しました！")
+                    st.write(f"**料理名:** {res.get('dish_name')}")
+                    st.write(f"**推定カロリー:** 約 {res.get('total_calories')} kcal")
+                    st.write(f"**推奨区分:** {res.get('meal_type')}")
+                    st.caption(f"メモ: {res.get('description')}")
+
+                    if st.button("この結果を入力欄に反映する"):
+                        m_type = res.get("meal_type")
+                        c_val = float(res.get("total_calories", 0))
+
+                        if m_type == "朝食":
+                            st.session_state.ai_b = c_val
+                        elif m_type == "昼食":
+                            st.session_state.ai_l = c_val
+                        elif m_type == "夕食":
+                            st.session_state.ai_d = c_val
+                        else:
+                            st.session_state.ai_s = c_val
+
+                        st.success("入力欄に反映しました！「手入力」タブで保存を行ってください。")
+
+        with tab1:
+            col_b, col_l, col_d, col_s = st.columns(4)
+            with col_b:
+                in_b = st.number_input("朝食 (kcal)", min_value=0.0, value=float(st.session_state.ai_b), step=50.0, key="input_b")
+            with col_l:
+                in_l = st.number_input("昼食 (kcal)", min_value=0.0, value=float(st.session_state.ai_l), step=50.0, key="input_l")
+            with col_d:
+                in_d = st.number_input("夕食 (kcal)", min_value=0.0, value=float(st.session_state.ai_d), step=50.0, key="input_d")
+            with col_s:
+                in_s = st.number_input("間食 (kcal)", min_value=0.0, value=float(st.session_state.ai_s), step=50.0, key="input_s")
+
+            st.session_state.ai_b = in_b
+            st.session_state.ai_l = in_l
+            st.session_state.ai_d = in_d
+            st.session_state.ai_s = in_s
+
+            sub_total = in_b + in_l + in_d + in_s
+            st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
+
+            if st.button("食事記録を保存", type="primary"):
+                food_data = {
+                    "date": f_date_str,
+                    "breakfast_cal": in_b,
+                    "lunch_cal": in_l,
+                    "dinner_cal": in_d,
+                    "snack_cal": in_s,
+                }
+                supabase.table("food_logs").upsert(food_data).execute()
+                st.success("食事記録を保存しました。")
+                st.rerun()
 
     # --------------------------------------------------
-    # タブ3: 筋トレ記録
+    # 画面3: 筋トレ記録
     # --------------------------------------------------
-    with tab3:
-        st.header("筋トレログ & 消費カロリー推定")
+    elif st.session_state.view == "workout":
+        red_banner("筋トレログ & 消費カロリー推定")
 
-        col_date, col_part = st.columns(2)
-        with col_date:
-            work_date = st.date_input(
-                "日付", value=datetime.date.today(), key="w_date"
-            )
-            w_date_str = work_date.strftime("%Y-%m-%d")
-        with col_part:
-            part = st.selectbox(
-                "部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"]
-            )
-
-        ex_res = supabase.table("exercises").select("name").eq("part", part).execute()
-        ex_list = [item["name"] for item in ex_res.data] if ex_res.data else ["（種目がありません）"]
-        exercise = st.selectbox("種目", ex_list)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            weight_val = st.number_input(
-                "重量 (kg)", min_value=0.0, step=0.5, value=0.0
-            )
-        with col2:
-            reps_val = st.number_input(
-                "回数 (レップ)", min_value=0, step=1, value=0
-            )
-
-        col_time, col_int = st.columns(2)
-        with col_time:
-            duration = st.number_input(
-                "実施時間 (分)", min_value=0, max_value=300, value=60, step=5
-            )
+        red_banner("① セッション全体の設定")
+        col_dur, col_int = st.columns(2)
+        with col_dur:
+            duration = st.number_input("全体実施時間 (分)", min_value=1, max_value=300, value=60, step=5)
         with col_int:
             intensity = st.selectbox(
                 "運動強度",
@@ -426,12 +645,31 @@ def main():
             )
 
         estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
-        st.caption(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+        st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
 
-        if st.button("筋トレ記録を保存"):
+        st.divider()
+        red_banner("② 種目の記録")
+
+        col_date, col_part = st.columns(2)
+        with col_date:
+            work_date = st.date_input("日付", value=datetime.date.today(), key="w_date")
+            w_date_str = work_date.strftime("%Y-%m-%d")
+        with col_part:
+            part = st.selectbox("部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"])
+
+        ex_res = supabase.table("exercises").select("name").eq("part", part).execute()
+        ex_list = [r["name"] for r in ex_res.data] if ex_res.data else ["（種目がありません）"]
+        exercise = st.selectbox("種目", ex_list)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            weight_val = st.number_input("重量 (kg)", min_value=0.0, step=0.5, value=40.0)
+        with col2:
+            reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=10)
+
+        if st.button("筋トレ記録を保存", type="primary"):
             if exercise != "（種目がありません）":
-                data = {
-                    "user_id": user_id,
+                workout_data = {
                     "date": w_date_str,
                     "part": part,
                     "exercise": exercise,
@@ -441,17 +679,39 @@ def main():
                     "intensity": intensity,
                     "burned_calories": estimated_burn,
                 }
-                supabase.table("workout_logs").insert(data).execute()
-                st.success("筋トレ記録を保存しました。")
+                supabase.table("workout_logs").insert(workout_data).execute()
+                st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
                 st.rerun()
 
         st.divider()
-        st.subheader("本日の筋トレ記録")
-        w_logs_res = supabase.table("workout_logs").select("part, exercise, weight, reps, duration_min, burned_calories").eq("user_id", user_id).eq("date", w_date_str).execute()
-        if w_logs_res.data:
-            df = pd.DataFrame(w_logs_res.data)
-            df.columns = ["部位", "種目", "重量(kg)", "回数", "時間(分)", "消費(kcal)"]
-            st.dataframe(df, use_container_width=True)
+        red_banner("本日の筋トレ記録")
+        logs_res = supabase.table("workout_logs").select("id, exercise, weight, reps").eq("date", w_date_str).order("id").execute()
+        
+        if logs_res.data:
+            logs_df = pd.DataFrame(logs_res.data)
+            cards_html = ""
+            for exercise_name, group in logs_df.groupby("exercise", sort=False):
+                rows_html = (
+                    '<div class="ex-set-row head">'
+                    "<div>セット</div><div>重さ</div><div>回数</div><div>RM</div></div>"
+                )
+                for set_no, (_, row) in enumerate(group.iterrows(), start=1):
+                    estimated_rm = row["weight"] * (1 + 0.025 * row["reps"])
+                    rows_html += (
+                        '<div class="ex-set-row">'
+                        f"<div>{set_no}</div>"
+                        f"<div>{row['weight']:g} kg</div>"
+                        f"<div>{int(row['reps'])} 回</div>"
+                        f"<div>{estimated_rm:.1f} kg</div>"
+                        "</div>"
+                    )
+                cards_html += (
+                    '<div class="ex-card">'
+                    f'<div class="ex-card-header">{exercise_name}</div>'
+                    f"{rows_html}"
+                    "</div>"
+                )
+            st.markdown(cards_html, unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
 
