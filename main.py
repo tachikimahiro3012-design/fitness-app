@@ -142,7 +142,7 @@ def analyze_food_image(image: Image.Image, api_key: str):
         }
         """
         response = client.models.generate_content(
-            model="gemini-2.5-flash", contents=[image, prompt]
+            model="gemini-3.8-flash", contents=[image, prompt]
         )
 
         text = response.text.strip()
