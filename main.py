@@ -22,20 +22,34 @@ st.set_page_config(
 # --------------------------------------------------
 @st.cache_resource
 def init_supabase() -> Client:
-    # Streamlit Secrets から Supabase URL と Key を取得
     url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
     key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
     
     if not url or not key:
-        st.error("Supabaseの接続情報（SUPABASE_URL, SUPABASE_KEY）が見つかりません。")
+        st.error("【設定エラー】.streamlit/secrets.toml または Streamlit Cloud の Secrets に SUPABASE_URL と SUPABASE_KEY を設定してください。")
         st.stop()
     return create_client(url, key)
 
 supabase = init_supabase()
 
-# --------------------------------------------------
+# デフォルト種目の初期登録処理
+def init_default_exercises():
+    default_exercises = [
+        ("胸", "ベンチプレス"), ("胸", "インクラインダンベルプレス"), ("胸", "ダンベルプレス"),
+        ("胸", "スミスインクラインベンチプレス"), ("胸", "チェストプレス"), ("胸", "ペックフライ"), ("胸", "ケーブルフライ"),
+        ("二頭", "インクラインダンベルカール"), ("二頭", "ダンベルハンマーカール"), ("二頭", "ケーブルカール"), ("二頭", "プリチャーハンマーカール"),
+        ("三頭", "フレンチプレス"), ("三頭", "ケーブルプレスダウン"),
+        ("背中", "チンニング"), ("背中", "ベントオーバーローイング"), ("背中", "ワンハンドローイング"), ("背中", "ラットプルダウン"), ("背中", "シーテッドローイング"),
+        ("肩", "ダンベルショルダープレス"), ("肩", "スミスショルダープレス"), ("肩", "サイドレイズ"), ("肩", "インクラインサイドレイズ"), ("肩", "ケーブルフェイスプル"), ("肩", "ケーブルフロントレイズ"),
+        ("脚", "スクワット"), ("脚", "45度レッグプレス"), ("脚", "レッグプレス"), ("脚", "ブルガリアンスクワット"), ("脚", "レッグエクステンション"), ("脚", "レッグカール"), ("脚", "インナーサイ"),
+    ]
+    for part, name in default_exercises:
+        try:
+            supabase.table("exercises").insert({"part": part, "name": name}).execute()
+        except Exception:
+            pass
+
 # Gemini AIによる画像解析関数
-# --------------------------------------------------
 def analyze_food_image(image: Image.Image, api_key: str):
     try:
         client = genai.Client(api_key=api_key)
@@ -68,9 +82,7 @@ def analyze_food_image(image: Image.Image, api_key: str):
         return None, str(e)
 
 # BMR / TDEE / 目標カロリー計算
-def calculate_nutrition_targets(
-    gender, age, height, weight, activity_level, steps, goal_phase
-):
+def calculate_nutrition_targets(gender, age, height, weight, activity_level, steps, goal_phase):
     if gender == "男性":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
     else:
@@ -112,9 +124,7 @@ def calculate_workout_burn(weight, duration_min, intensity):
     burn = (mets - 1.0) * weight * (duration_min / 60.0) * 1.05
     return round(burn, 1)
 
-# --------------------------------------------------
 # UI用CSS
-# --------------------------------------------------
 def inject_theme_css():
     st.markdown(
         """
@@ -228,8 +238,48 @@ def red_banner(text: str):
     st.markdown(f'<div class="section-banner">{text}</div>', unsafe_allow_html=True)
 
 def main():
-    # Supabaseからユーザープロフィールを取得
-    res = supabase.table("user_profile").select("*").limit(1).execute()
+    inject_theme_css()
+
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+    # --- 1. 未ログイン時：ログイン / 新規登録画面 ---
+    if st.session_state.user is None:
+        st.title("FITNESS & NUTRITION TRACKER")
+        auth_mode = st.radio("機能を選択", ["ログイン", "新規アカウント登録"], horizontal=True)
+        
+        with st.form("auth_form"):
+            email = st.text_input("メールアドレス")
+            password = st.text_input("パスワード", type="password")
+            
+            submit_label = "アカウント作成" if auth_mode == "新規アカウント登録" else "ログイン"
+            submitted = st.form_submit_button(submit_label, type="primary")
+
+        if submitted:
+            if not email or not password:
+                st.error("メールアドレスとパスワードを両方入力してください。")
+            elif auth_mode == "新規アカウント登録":
+                try:
+                    res = supabase.auth.sign_up({"email": email.strip(), "password": password})
+                    st.success("アカウントが作成されました！「ログイン」に切り替えてログインしてください。")
+                except Exception as e:
+                    st.error(f"登録エラー: {e}")
+            else:
+                try:
+                    res = supabase.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                    st.session_state.user = res.user
+                    init_default_exercises()
+                    st.success("ログインに成功しました！")
+                    st.rerun()
+                except Exception as e:
+                    st.error("ログインエラー: メールアドレスまたはパスワードを確認してください。")
+        return
+
+    # --- 2. ログイン後：メインアプリ画面 ---
+    user_id = st.session_state.user.id
+
+    # ユーザープロフィール取得
+    res = supabase.table("user_profile").select("*").eq("user_id", user_id).execute()
     profile = res.data[0] if res.data else None
 
     if profile:
@@ -248,6 +298,13 @@ def main():
 
     # サイドバー：設定
     st.sidebar.title("ユーザー設定")
+    st.sidebar.caption(f"ログイン中: {st.session_state.user.email}")
+    if st.sidebar.button("ログアウト"):
+        supabase.auth.sign_out()
+        st.session_state.user = None
+        st.rerun()
+
+    st.sidebar.divider()
     with st.sidebar.form("profile_form"):
         api_key_input = st.text_input(
             "Gemini API Key",
@@ -279,6 +336,7 @@ def main():
 
         if st.form_submit_button("設定を保存"):
             profile_data = {
+                "user_id": user_id,
                 "gender": gender,
                 "age": age,
                 "height": height,
@@ -288,12 +346,6 @@ def main():
                 "goal_phase": goal_phase,
                 "api_key": api_key_input.strip(),
             }
-
-            # 既存のレコードがあれば user_id をセットして更新（なければ新規作成）
-            if profile and "user_id" in profile:
-                profile_data["user_id"] = profile["user_id"]
-                supabase.table("user_profile").upsert(profile_data).execute()
-            
             supabase.table("user_profile").upsert(profile_data).execute()
             st.sidebar.success("設定を更新しました。")
             st.rerun()
@@ -320,7 +372,7 @@ def main():
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
     # 今日の食事記録を取得
-    food_res = supabase.table("food_logs").select("*").eq("date", today_str).execute()
+    food_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", today_str).execute()
     food_row = food_res.data[0] if food_res.data else None
     total_ingested_cal = (
         (food_row.get("breakfast_cal", 0) or 0) +
@@ -330,10 +382,8 @@ def main():
     ) if food_row else 0.0
 
     # 今日の筋トレ消費カロリーを取得
-    workout_res = supabase.table("workout_logs").select("burned_calories").eq("date", today_str).execute()
+    workout_res = supabase.table("workout_logs").select("burned_calories").eq("user_id", user_id).eq("date", today_str).execute()
     total_workout_burn = sum([item.get("burned_calories", 0) or 0 for item in workout_res.data]) if workout_res.data else 0.0
-
-    inject_theme_css()
 
     st.markdown(
         f"""
@@ -447,10 +497,10 @@ def main():
         month_end = f"{next_month_year}-{next_month:02d}-01"
 
         # 当月の筋トレログと食事ログを取得
-        w_month_res = supabase.table("workout_logs").select("date").gte("date", month_start).lt("date", month_end).execute()
+        w_month_res = supabase.table("workout_logs").select("date").eq("user_id", user_id).gte("date", month_start).lt("date", month_end).execute()
         recorded_dates = set([r["date"] for r in w_month_res.data]) if w_month_res.data else set()
 
-        f_month_res = supabase.table("food_logs").select("date, breakfast_cal, lunch_cal, dinner_cal, snack_cal").gte("date", month_start).lt("date", month_end).execute()
+        f_month_res = supabase.table("food_logs").select("date, breakfast_cal, lunch_cal, dinner_cal, snack_cal").eq("user_id", user_id).gte("date", month_start).lt("date", month_end).execute()
         food_cal_by_date = {}
         if f_month_res.data:
             for r in f_month_res.data:
@@ -538,7 +588,7 @@ def main():
         food_date = st.date_input("記録日", value=datetime.date.today())
         f_date_str = food_date.strftime("%Y-%m-%d")
 
-        f_res = supabase.table("food_logs").select("*").eq("date", f_date_str).execute()
+        f_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", f_date_str).execute()
         f_row = f_res.data[0] if f_res.data else None
 
         if "last_food_date" not in st.session_state or st.session_state.last_food_date != f_date_str:
@@ -619,13 +669,14 @@ def main():
 
             if st.button("食事記録を保存", type="primary"):
                 food_data = {
+                    "user_id": user_id,
                     "date": f_date_str,
                     "breakfast_cal": in_b,
                     "lunch_cal": in_l,
                     "dinner_cal": in_d,
                     "snack_cal": in_s,
                 }
-                supabase.table("food_logs").upsert(food_data).execute()
+                supabase.table("food_logs").upsert(food_data, on_conflict="user_id,date").execute()
                 st.success("食事記録を保存しました。")
                 st.rerun()
 
@@ -675,6 +726,7 @@ def main():
         if st.button("筋トレ記録を保存", type="primary"):
             if exercise != "（種目がありません）":
                 workout_data = {
+                    "user_id": user_id,
                     "date": w_date_str,
                     "part": part,
                     "exercise": exercise,
@@ -690,7 +742,7 @@ def main():
 
         st.divider()
         red_banner("本日の筋トレ記録")
-        logs_res = supabase.table("workout_logs").select("id, exercise, weight, reps").eq("date", w_date_str).order("id").execute()
+        logs_res = supabase.table("workout_logs").select("id, exercise, weight, reps").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
         
         if logs_res.data:
             logs_df = pd.DataFrame(logs_res.data)
