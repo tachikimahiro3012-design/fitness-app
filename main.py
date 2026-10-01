@@ -229,7 +229,7 @@ def red_banner(text: str):
 
 def main():
     # Supabaseからユーザープロフィールを取得
-    res = supabase.table("user_profile").select("*").eq("id", 1).execute()
+    res = supabase.table("user_profile").select("*").limit(1).execute()
     profile = res.data[0] if res.data else None
 
     if profile:
@@ -279,7 +279,6 @@ def main():
 
         if st.form_submit_button("設定を保存"):
             profile_data = {
-                "id": 1,
                 "gender": gender,
                 "age": age,
                 "height": height,
@@ -289,6 +288,12 @@ def main():
                 "goal_phase": goal_phase,
                 "api_key": api_key_input.strip(),
             }
+
+            # 既存のレコードがあれば user_id をセットして更新（なければ新規作成）
+            if profile and "user_id" in profile:
+                profile_data["user_id"] = profile["user_id"]
+                supabase.table("user_profile").upsert(profile_data).execute()
+            
             supabase.table("user_profile").upsert(profile_data).execute()
             st.sidebar.success("設定を更新しました。")
             st.rerun()
