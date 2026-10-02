@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import pandas as pd
+import plotly.express as px
 from PIL import Image
 import streamlit as st
 from google import genai
@@ -234,6 +235,89 @@ def inject_theme_css():
         unsafe_allow_html=True,
     )
 
+# --------------------------------------------------
+# 種目別パフォーマンス分析ダイアログ
+# --------------------------------------------------
+@st.dialog("種目別パフォーマンス分析", width="large")
+def show_exercise_analytics(user_id, exercise_name, supabase):
+  st.write(f"### {exercise_name}")
+
+  # 該当種目の全履歴を取得
+  res = (
+      supabase.table("workout_logs")
+      .select("*")
+      .eq("user_id", user_id)
+      .eq("exercise", exercise_name)
+      .order("date")
+      .execute()
+  )
+  df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
+
+  if df.empty or "weight" not in df or df["weight"].isnull().all():
+    st.info("この種目の過去データがまだありません。")
+    return
+
+  # 0kg・0回のデータを除外
+  df = df[(df["weight"] > 0) & (df["reps"] > 0)].copy()
+
+  if df.empty:
+    st.info("有効なトレーニングデータがありません。")
+    return
+
+  # 各セットの推定1RMと総挙上重量を計算
+  df["est_1rm"] = df["weight"] * (1 + 0.025 * df["reps"])
+  df["volume"] = df["weight"] * df["reps"]
+
+  # 日付ごとのMAX値を抽出
+  daily_summary = (
+      df.groupby("date")
+      .agg(
+          max_weight=("weight", "max"),
+          max_reps=("reps", "max"),
+          max_1rm=("est_1rm", "max"),
+          total_volume=("volume", "sum"),
+      )
+      .reset_index()
+  )
+
+  # 数値（メトリクス）表示
+  c1, c2, c3, c4 = st.columns(4)
+  c1.metric("Max Weight", f"{daily_summary['max_weight'].max():.1f} kg")
+  c2.metric("Max Reps", f"{int(daily_summary['max_reps'].max())} 回")
+  c3.metric("Max 1RM", f"{daily_summary['max_1rm'].max():.1f} kg")
+  c4.metric("最高1日Volume", f"{int(daily_summary['total_volume'].max()):,} kg")
+
+  st.divider()
+
+  # グラフ表示タブ
+  tab1, tab2 = st.tabs(["重量・1RM 推移", "総挙上量 (Volume)"])
+
+  with tab1:
+    fig = px.line(
+        daily_summary,
+        x="date",
+        y=["max_weight", "max_1rm"],
+        labels={"value": "重量 (kg)", "date": "日付", "variable": "指標"},
+        title="最高重量・推定1RM の推移",
+        markers=True,
+    )
+    fig.for_each_trace(
+        lambda t: t.update(
+            name="最高重量 (kg)" if t.name == "max_weight" else "推定1RM (kg)"
+        )
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+  with tab2:
+    fig_vol = px.bar(
+        daily_summary,
+        x="date",
+        y="total_volume",
+        labels={"total_volume": "総挙上量 (kg)", "date": "日付"},
+        title="日別の総トレーニング負荷 (Volume)",
+    )
+    st.plotly_chart(fig_vol, use_container_width=True)
+
 def red_banner(text: str):
     st.markdown(f'<div class="section-banner">{text}</div>', unsafe_allow_html=True)
 
@@ -242,6 +326,12 @@ def main():
 
     if "user" not in st.session_state:
         st.session_state.user = None
+
+    # 【追加】保存されているログイン情報があれば自動で復元
+    if st.session_state.user is None:
+        session_res = supabase.auth.get_session()
+        if session_res and session_res.user:
+            st.session_state.user = session_res.user
 
     # --- 1. 未ログイン時：ログイン / 新規登録画面 ---
     if st.session_state.user is None:
@@ -350,19 +440,6 @@ def main():
             st.sidebar.success("設定を更新しました。")
             st.rerun()
 
-    # 種目追加
-    st.sidebar.divider()
-    st.sidebar.title("種目追加")
-    new_part = st.sidebar.selectbox("部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"])
-    new_ex = st.sidebar.text_input("種目名")
-    if st.sidebar.button("種目を追加"):
-        if new_ex.strip() != "":
-            try:
-                supabase.table("exercises").insert({"part": new_part, "name": new_ex.strip()}).execute()
-                st.sidebar.success(f"「{new_ex}」を追加しました。")
-                st.rerun()
-            except Exception:
-                st.sidebar.warning("既に登録されているか、エラーが発生しました。")
 
     # 計算実行
     bmr, tdee, target_cal, offset = calculate_nutrition_targets(
@@ -420,6 +497,10 @@ def main():
     # --------------------------------------------------
     # 画面1: ホーム
     # --------------------------------------------------
+    # 選択された日付の保持（初期値は今日）
+    if "target_date" not in st.session_state:
+        st.session_state.target_date = datetime.date.today()
+        
     if st.session_state.view == "dashboard":
         red_banner("今日の状態")
 
@@ -489,12 +570,44 @@ def main():
 
         now = datetime.date.today()
         today_str_display = now.strftime("%Y-%m-%d")
-        st.subheader(f"{now.year}年 {now.month}月")
 
-        month_start = f"{now.year}-{now.month:02d}-01"
-        next_month = now.month + 1 if now.month < 12 else 1
-        next_month_year = now.year if now.month < 12 else now.year + 1
-        month_end = f"{next_month_year}-{next_month:02d}-01"
+        # 表示する年月をsession_stateで管理（初期値は当月）
+        if "cal_year" not in st.session_state:
+            st.session_state.cal_year = now.year
+        if "cal_month" not in st.session_state:
+            st.session_state.cal_month = now.month
+
+        cal_y = st.session_state.cal_year
+        cal_m = st.session_state.cal_month
+
+        # 月切り替えヘッダーとボタン
+        c_prev, c_title, c_next = st.columns([1, 3, 1])
+        with c_prev:
+            if st.button("◀ 前月", use_container_width=True):
+                if cal_m == 1:
+                    st.session_state.cal_year -= 1
+                    st.session_state.cal_month = 12
+                else:
+                    st.session_state.cal_month -= 1
+                st.rerun()
+
+        with c_title:
+            st.markdown(f"<h3 style='text-align: center; margin: 0;'>{cal_y}年 {cal_m}月</h3>", unsafe_allow_html=True)
+
+        with c_next:
+            if st.button("次月 ▶", use_container_width=True):
+                if cal_m == 12:
+                    st.session_state.cal_year += 1
+                    st.session_state.cal_month = 1
+                else:
+                    st.session_state.cal_month += 1
+                st.rerun()
+
+        # 該当月の日付範囲の計算
+        month_start = f"{cal_y}-{cal_m:02d}-01"
+        next_m = cal_m + 1 if cal_m < 12 else 1
+        next_y = cal_y if cal_m < 12 else cal_y + 1
+        month_end = f"{next_y}-{next_m:02d}-01"
 
         # 当月の筋トレログと食事ログを取得
         w_month_res = supabase.table("workout_logs").select("date").eq("user_id", user_id).gte("date", month_start).lt("date", month_end).execute()
@@ -532,42 +645,47 @@ def main():
             unsafe_allow_html=True,
         )
 
+        # --------------------------------------------------
+        # カレンダー描画（ボタン形式へ変更）
+        # --------------------------------------------------
         days_abbr = ["日", "月", "火", "水", "木", "金", "土"]
-        head_html = "".join(f'<div class="cal-head">{d}</div>' for d in days_abbr)
+        h_cols = st.columns(7)
+        for idx, d_name in enumerate(days_abbr):
+            h_cols[idx].markdown(f"**<div style='text-align:center;'>{d_name}</div>**", unsafe_allow_html=True)
 
-        cells_html = ""
-        month_cal = calendar.monthcalendar(now.year, now.month)
+        month_cal = calendar.monthcalendar(cal_y, cal_m)
         for week in month_cal:
-            for day in week:
+            w_cols = st.columns(7)
+            for idx, day in enumerate(week):
                 if day == 0:
-                    cells_html += '<div class="cal-cell empty"></div>'
+                    w_cols[idx].write("")
                     continue
 
-                date_str = f"{now.year}-{now.month:02d}-{day:02d}"
-                is_today = date_str == today_str_display
+                date_obj = datetime.date(cal_y, cal_m, day)
+                date_str = date_obj.strftime("%Y-%m-%d")
+
                 has_workout = date_str in recorded_dates
                 cal_total = food_cal_by_date.get(date_str)
 
-                today_class = " today" if is_today else ""
-                dot_html = '<div class="cal-workout-dot"></div>' if has_workout else '<div class="cal-no-dot"></div>'
+                # ボタンに表示するテキスト
+                label_parts = [f"{day}"]
+                if has_workout:
+                    label_parts.append("●")
+                if cal_total is not None:
+                    label_parts.append(f"{int(cal_total)}k")
 
-                if cal_total is None:
-                    cal_html = '<div class="cal-cal-num none">-</div>'
-                elif cal_total <= target_cal:
-                    cal_html = f'<div class="cal-cal-num under">{int(cal_total)}</div>'
-                else:
-                    cal_html = f'<div class="cal-cal-num over">{int(cal_total)}</div>'
+                btn_label = " ".join(label_parts)
 
-                cells_html += (
-                    f'<div class="cal-cell{today_class}">'
-                    f'<div class="cal-day-num">{day}</div>'
-                    f'{dot_html}'
-                    f'{cal_html}'
-                    f'</div>'
-                )
-
-        st.markdown(f'<div class="cal-grid">{head_html}{cells_html}</div>', unsafe_allow_html=True)
-
+                # 日付ボタンを配置
+                if w_cols[idx].button(btn_label, key=f"cal_btn_{date_str}", use_container_width=True):
+                    st.session_state.target_date = date_obj
+                    # 筋トレ記録があれば「筋トレ記録」画面へ、なければ「食事記録」画面へ直接ジャンプ
+                    if has_workout:
+                        st.session_state.view = "workout"
+                    else:
+                        st.session_state.view = "food"
+                    st.rerun()
+  
         st.markdown(
             """
             <div class="cal-legend">
@@ -585,7 +703,8 @@ def main():
     elif st.session_state.view == "food":
         red_banner("食事カロリー入力")
 
-        food_date = st.date_input("記録日", value=datetime.date.today())
+        food_date = st.date_input("記録日", value=st.session_state.target_date)
+        st.session_state.target_date = food_date
         f_date_str = food_date.strftime("%Y-%m-%d")
 
         f_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", f_date_str).execute()
@@ -689,7 +808,8 @@ def main():
         red_banner("① セッション全体の設定")
         col_dur, col_int = st.columns(2)
         with col_dur:
-            duration = st.number_input("全体実施時間 (分)", min_value=1, max_value=300, value=60, step=5)
+            duration_input = st.number_input("全体実施時間 (分)", min_value=0, step=5, value=None, placeholder="0")
+            duration = duration_input or 0
         with col_int:
             intensity = st.selectbox(
                 "運動強度",
@@ -708,21 +828,122 @@ def main():
 
         col_date, col_part = st.columns(2)
         with col_date:
-            work_date = st.date_input("日付", value=datetime.date.today(), key="w_date")
+            work_date = st.date_input("日付", value=st.session_state.target_date, key="w_date")
+            st.session_state.target_date = work_date
             w_date_str = work_date.strftime("%Y-%m-%d")
         with col_part:
             part = st.selectbox("部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"])
 
-        ex_res = supabase.table("exercises").select("name").eq("part", part).execute()
-        ex_list = [r["name"] for r in ex_res.data] if ex_res.data else ["（種目がありません）"]
-        exercise = st.selectbox("種目", ex_list)
+
+        ex_res = (
+            supabase.table("exercises")
+            .select("name")
+            .eq("part", part)
+            .execute()
+        )
+        ex_list = (
+            [r["name"] for r in ex_res.data] if ex_res.data else []
+        )  #[cite: 9]
+
+        # ドロップダウンの選択肢を作成
+        add_option_text = "+ 新しい種目を追加..."
+        options = ex_list + [add_option_text]
+
+        # 種目選択と削除ボタンを横並びにするレイアウト
+        col_select, col_del = st.columns([5, 1])
+        with col_select:
+          exercise = st.selectbox("種目", options)
+
+        with col_del:
+          st.write("")  # 位置調整用の余白
+          st.write("")
+          # 「新規種目を追加...」以外が選ばれている場合のみ削除ボタンを表示
+          if exercise != add_option_text and ex_list:
+            if st.button("削除", key=f"btn_delete_start_{exercise}"):
+              # 1段階目の確認フラグを立てる
+              st.session_state[f"confirm_del_step1_{exercise}"] = True
+
+        # --------------------------------------------------
+        # 新規種目の追加処理
+        # --------------------------------------------------
+        if exercise == add_option_text:
+          new_ex_name = st.text_input(
+              f"追加する【{part}】の種目名を入力",
+              placeholder="例: ダンベルインクラインフライ",
+          )
+          if st.button("この種目を登録", type="primary"):
+            if new_ex_name.strip():
+              try:
+                supabase.table("exercises").insert(
+                    {"part": part, "name": new_ex_name.strip()}
+                ).execute()
+                st.success(f"「{new_ex_name.strip()}」を登録しました！")
+                st.rerun()
+              except Exception:
+                st.warning("既に登録されているか、エラーが発生しました。")
+            else:
+              st.warning("種目名を入力してください。")
+
+        # --------------------------------------------------
+        # 種目の削除処理（2段階確認）
+        # --------------------------------------------------
+        # 1段階目の確認（「本当に削除しますか？」）
+        if st.session_state.get(f"confirm_del_step1_{exercise}", False):
+          st.warning(f"種目「**{exercise}**」を削除しますか？")
+          c1, c2 = st.columns(2)
+          with c1:
+            if st.button(
+                "はい（最終確認へ）",
+                key=f"btn_del_step1_yes_{exercise}",
+                type="primary",
+            ):
+              st.session_state[f"confirm_del_step1_{exercise}"] = False
+              st.session_state[f"confirm_del_step2_{exercise}"] = True
+              st.rerun()
+          with c2:
+            if st.button("キャンセル", key=f"btn_del_step1_no_{exercise}"):
+              st.session_state[f"confirm_del_step1_{exercise}"] = False
+              st.rerun()
+
+        # 2段階目の確認（「過去の記録も消えますがよろしいですか？」）
+        if st.session_state.get(f"confirm_del_step2_{exercise}", False):
+          st.error(
+              f"**警告：** 「**{exercise}**」に関連する過去のトレーニング記録や分析データもすべて削除されます。本当に削除してよろしいですか？"
+          )
+          c1, c2 = st.columns(2)
+          with c1:
+            if st.button(
+                "すべてのデータを完全に削除する",
+                key=f"btn_del_step2_yes_{exercise}",
+                type="primary",
+            ):
+              try:
+                # 1. 過去ログの削除（workout_logs）
+                supabase.table("workout_logs").delete().eq(
+                    "exercise", exercise
+                ).execute()
+                # 2. 種目自体の削除（exercises）
+                supabase.table("exercises").delete().eq(
+                    "name", exercise
+                ).eq("part", part).execute()
+
+                st.session_state[f"confirm_del_step2_{exercise}"] = False
+                st.success(
+                    f"「{exercise}」と関連するデータを削除しました。"
+                )
+                st.rerun()
+              except Exception as e:
+                st.error(f"削除処理中にエラーが発生しました: {e}")
+          with c2:
+            if st.button("やめる", key=f"btn_del_step2_no_{exercise}"):
+              st.session_state[f"confirm_del_step2_{exercise}"] = False
+              st.rerun()
 
         col1, col2 = st.columns(2)
         with col1:
-            weight_val = st.number_input("重量 (kg)", min_value=0.0, step=0.5, value=40.0)
+            weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
         with col2:
-            reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=10)
-
+            reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=None, placeholder="0") or 0
         if st.button("筋トレ記録を保存", type="primary"):
             if exercise != "（種目がありません）":
                 workout_data = {
@@ -747,27 +968,70 @@ def main():
         if logs_res.data:
             logs_df = pd.DataFrame(logs_res.data)
             cards_html = ""
-            for exercise_name, group in logs_df.groupby("exercise", sort=False):
-                rows_html = (
-                    '<div class="ex-set-row head">'
-                    "<div>セット</div><div>重さ</div><div>回数</div><div>RM</div></div>"
-                )
+        # --- 本日の筋トレ記録データ取得 ---
+        w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", work_date).order("id").execute()
+        workout_df = pd.DataFrame(w_res.data) if w_res.data else pd.DataFrame()
+
+        if not workout_df.empty:
+            for ex_name, group in workout_df.groupby("exercise", sort=False):
+                # 種目名と分析ボタンを横並びに配置
+                col_title, col_btn = st.columns([5, 1])
+                with col_title:
+                    st.subheader(f"{ex_name}")
+                with col_btn:
+                    if st.button("分析", key=f"analytics_{ex_name}", use_container_width=True):
+                        show_exercise_analytics(user_id, ex_name, supabase)
+
+                # テーブルのヘッダー風表示
+                h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([1, 2, 2, 2, 2])
+                h_col1.caption("**セット**")
+                h_col2.caption("**重さ (kg)**")
+                h_col3.caption("**回数**")
+                h_col4.caption("**推定RM**")
+                h_col5.caption("**操作**")
+
                 for set_no, (_, row) in enumerate(group.iterrows(), start=1):
-                    estimated_rm = row["weight"] * (1 + 0.025 * row["reps"])
-                    rows_html += (
-                        '<div class="ex-set-row">'
-                        f"<div>{set_no}</div>"
-                        f"<div>{row['weight']:g} kg</div>"
-                        f"<div>{int(row['reps'])} 回</div>"
-                        f"<div>{estimated_rm:.1f} kg</div>"
-                        "</div>"
+                    log_id = row["id"]
+                    c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 2])
+
+                    c1.write(f"**{set_no}**")
+
+                    # 入力フォーム（変更検知用に on_change や差分チェックを利用）
+                    new_weight = c2.number_input(
+                        "重さ",
+                        value=float(row["weight"]),
+                        step=2.5,
+                        format="%.1f",
+                        key=f"w_{log_id}",
+                        label_visibility="collapsed"
                     )
-                cards_html += (
-                    '<div class="ex-card">'
-                    f'<div class="ex-card-header">{exercise_name}</div>'
-                    f"{rows_html}"
-                    "</div>"
-                )
+                    new_reps = c3.number_input(
+                        "回数", value=int(row["reps"]), min_value=0, step=1, key=f"r_{log_id}", label_visibility="collapsed"
+                    )
+
+                    # --- 【ここを追加】数値が変更されたら即座にデータベース上書き ---
+                    if new_weight != float(row["weight"]) or new_reps != int(row["reps"]):
+                        supabase.table("workout_logs").update({
+                            "weight": new_weight,
+                            "reps": new_reps
+                        }).eq("id", log_id).execute()
+                        st.toast("記録を更新しました！")
+                        st.rerun()
+
+                    # RMのリアルタイム計算表示
+                    if new_reps > 0:
+                        est_rm = new_weight * (1 + 0.025 * new_reps)
+                        c4.write(f"{est_rm:.1f} kg")
+                    else:
+                        c4.write("-")
+
+                    # 削除ボタン
+                    if c5.button("×", key=f"del_{log_id}", help="このセットを削除"):
+                        supabase.table("workout_logs").delete().eq("id", log_id).execute()
+                        st.toast("セットを削除しました。")
+                        st.rerun() 
+
+                st.divider()
             st.markdown(cards_html, unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
