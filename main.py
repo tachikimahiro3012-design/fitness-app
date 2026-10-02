@@ -83,12 +83,15 @@ def analyze_food_image(image: Image.Image, api_key: str):
         return None, str(e)
 
 # BMR / TDEE / 目標カロリー計算
-def calculate_nutrition_targets(gender, age, height, weight, activity_level, steps, goal_phase):
+def calculate_nutrition_targets(
+    gender, age, height, weight, activity_level, steps, workout_burn, goal_phase
+):
     if gender == "男性":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
     else:
         bmr = 10 * weight + 6.25 * height - 5 * age - 161
 
+    # 1. 基本消費(日常活動レベルの倍率を反映)
     act_multipliers = {
         "デスクワーク中心": 1.2,
         "週1〜2回運動": 1.375,
@@ -96,8 +99,12 @@ def calculate_nutrition_targets(gender, age, height, weight, activity_level, ste
         "週5回以上運動": 1.725,
     }
     base_tdee = bmr * act_multipliers.get(activity_level, 1.2)
+
+    # 2. 歩数による消費
     step_burn = steps * 0.03
-    tdee = base_tdee + step_burn
+
+    # 3. 筋トレによる消費
+    tdee = base_tdee + step_burn + workout_burn
 
     phase_offsets = {
         "積極的減量 (-500 kcal)": -500,
@@ -107,11 +114,11 @@ def calculate_nutrition_targets(gender, age, height, weight, activity_level, ste
         "控えめ増量 (+200 kcal)": 200,
         "標準増量 (+300 kcal)": 300,
     }
+
     offset = phase_offsets.get(goal_phase, 0)
     target_cal = tdee + offset
 
     return round(bmr), round(tdee), round(target_cal), offset
-
 # METs計算
 def calculate_workout_burn(weight, duration_min, intensity):
     mets_map = {
@@ -374,11 +381,11 @@ def main():
 
     if profile:
         p_gender = profile.get("gender", "男性")
-        p_age = profile.get("age", 25)
+        p_age = profile.get("age", 20)
         p_height = profile.get("height", 170.0)
         p_weight = profile.get("weight", 65.0)
         p_act = profile.get("activity_level", "週3〜4回運動")
-        p_steps = profile.get("steps", 8000)
+        p_steps = profile.get("steps", 5000)
         p_goal = profile.get("goal_phase", "標準増量 (+300 kcal)")
         p_api_key = profile.get("api_key", "")
     else:
@@ -404,9 +411,9 @@ def main():
         )
         gender = st.selectbox("性別", ["男性", "女性"], index=0 if p_gender == "男性" else 1)
         age = st.number_input("年齢", min_value=10, max_value=100, value=int(p_age))
-        height = st.number_input("身長 (cm)", min_value=100.0, max_value=230.0, value=float(p_height))
-        weight = st.number_input("体重 (kg)", min_value=30.0, max_value=200.0, value=float(p_weight))
-        
+        # 身長入力（0.5cm刻み）
+        height = st.number_input("身長 (cm)",min_value=50.0,max_value=250.0,value=float(p_height),step=0.5,format="%.1f",)
+        weight = st.number_input("体重 (kg)",min_value=20.0,max_value=300.0,value=float(p_weight),step=0.5,format="%.1f",)
         act_options = ["デスクワーク中心", "週1〜2回運動", "週3〜4回運動", "週5回以上運動"]
         act_index = act_options.index(p_act) if p_act in act_options else 2
         act_level = st.selectbox("日常活動レベル", act_options, index=act_index)
@@ -442,8 +449,21 @@ def main():
 
 
     # 計算実行
+    # 以前は引数の並び順が関数定義とズレていて(活動レベルの文字列が
+    # steps の位置に入り、文字列×0.03でクラッシュしていた)、
+    # ここではキーワード引数にして取り違えが起きないようにしています。
+    # workout_burn は意図的に0固定にしています。目標摂取カロリー(TDEE)には
+    # 筋トレ消費を含めず、代わりに「実質エネルギー収支」側でのみ筋トレ消費を
+    # 差し引く方針にしたためです(目標値が一日の途中で動かないようにするため)。
     bmr, tdee, target_cal, offset = calculate_nutrition_targets(
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal
+        gender=p_gender,
+        age=p_age,
+        height=p_height,
+        weight=p_weight,
+        activity_level=p_act,
+        steps=p_steps,
+        workout_burn=0,
+        goal_phase=p_goal,
     )
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -459,8 +479,24 @@ def main():
     ) if food_row else 0.0
 
     # 今日の筋トレ消費カロリーを取得
-    workout_res = supabase.table("workout_logs").select("burned_calories").eq("user_id", user_id).eq("date", today_str).execute()
-    total_workout_burn = sum([item.get("burned_calories", 0) or 0 for item in workout_res.data]) if workout_res.data else 0.0
+    # workout_logs.burned_calories は保存時に常に0で入るようになったため、
+    # セット保存のたびにUPSERTされる daily_summaries.workout_burned_calories を使う
+    try:
+        summary_res = (
+            supabase.table("daily_summaries")
+            .select("workout_burned_calories")
+            .eq("user_id", user_id)
+            .eq("date", today_str)
+            .execute()
+        )
+        total_workout_burn = (
+            (summary_res.data[0].get("workout_burned_calories", 0) or 0)
+            if summary_res.data
+            else 0.0
+        )
+    except Exception:
+        # daily_summaries テーブルがまだ無い場合などのフォールバック
+        total_workout_burn = 0.0
 
     st.markdown(
         f"""
@@ -944,23 +980,38 @@ def main():
             weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
         with col2:
             reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=None, placeholder="0") or 0
+        
         if st.button("筋トレ記録を保存", type="primary"):
             if exercise != "（種目がありません）":
+            # 1. 各セットの記録（burned_calories は 0 で保存）
                 workout_data = {
-                    "user_id": user_id,
-                    "date": w_date_str,
-                    "part": part,
-                    "exercise": exercise,
-                    "weight": weight_val,
-                    "reps": reps_val,
-                    "duration_min": duration,
-                    "intensity": intensity,
-                    "burned_calories": estimated_burn,
-                }
-                supabase.table("workout_logs").insert(workout_data).execute()
-                st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
-                st.rerun()
+               "user_id": user_id,
+                "date": w_date_str,
+                "part": part,
+                "exercise": exercise,
+                "weight": weight_val,
+                "reps": reps_val,
+                "duration_min": duration,
+                "intensity": intensity,
+                "burned_calories": 0,  # ← 0 に変更して重複加算を防ぐ
+            }
+            supabase.table("workout_logs").insert(workout_data).execute()
 
+            # 2. その日の全体消費カロリーを daily_summaries（日別管理テーブル）に UPSERT 保存
+            try:
+                supabase.table("daily_summaries").upsert({
+                "user_id": user_id,
+                "date": w_date_str,
+                "workout_burned_calories": estimated_burn,  # その日の総消費カロリー（上書き保存）
+            }, on_conflict="user_id,date").execute()
+            except Exception as e:
+                # まだ daily_summaries テーブルが無い場合などのフォールバック処理
+                pass
+
+            st.success(
+                f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！"
+             )
+            st.rerun()
         st.divider()
         red_banner("本日の筋トレ記録")
         logs_res = supabase.table("workout_logs").select("id, exercise, weight, reps").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
