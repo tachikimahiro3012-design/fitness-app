@@ -35,6 +35,12 @@ supabase = init_supabase()
 
 # デフォルト種目の初期登録処理
 def init_default_exercises():
+    # 既に種目が1件でも登録されていれば、毎回のログインで31回APIを叩かないよう
+    # ここで打ち切る(初回のみ実行されるようにする)
+    existing = supabase.table("exercises").select("id").limit(1).execute()
+    if existing.data:
+        return
+
     default_exercises = [
         ("胸", "ベンチプレス"), ("胸", "インクラインダンベルプレス"), ("胸", "ダンベルプレス"),
         ("胸", "スミスインクラインベンチプレス"), ("胸", "チェストプレス"), ("胸", "ペックフライ"), ("胸", "ケーブルフライ"),
@@ -44,11 +50,11 @@ def init_default_exercises():
         ("肩", "ダンベルショルダープレス"), ("肩", "スミスショルダープレス"), ("肩", "サイドレイズ"), ("肩", "インクラインサイドレイズ"), ("肩", "ケーブルフェイスプル"), ("肩", "ケーブルフロントレイズ"),
         ("脚", "スクワット"), ("脚", "45度レッグプレス"), ("脚", "レッグプレス"), ("脚", "ブルガリアンスクワット"), ("脚", "レッグエクステンション"), ("脚", "レッグカール"), ("脚", "インナーサイ"),
     ]
-    for part, name in default_exercises:
-        try:
-            supabase.table("exercises").insert({"part": part, "name": name}).execute()
-        except Exception:
-            pass
+    rows = [{"part": part, "name": name} for part, name in default_exercises]
+    try:
+        supabase.table("exercises").insert(rows).execute()
+    except Exception:
+        pass
 
 # Gemini AIによる画像解析関数
 def analyze_food_image(image: Image.Image, api_key: str):
@@ -806,13 +812,13 @@ def main():
         with tab1:
             col_b, col_l, col_d, col_s = st.columns(4)
             with col_b:
-                in_b = st.number_input("朝食 (kcal)", min_value=0.0, value=float(st.session_state.ai_b), step=50.0, key="input_b")
+                in_b = st.number_input("朝食 (kcal)", min_value=0.0, value=float(st.session_state.ai_b), step=50.0, key=f"input_b_{f_date_str}")
             with col_l:
-                in_l = st.number_input("昼食 (kcal)", min_value=0.0, value=float(st.session_state.ai_l), step=50.0, key="input_l")
+                in_l = st.number_input("昼食 (kcal)", min_value=0.0, value=float(st.session_state.ai_l), step=50.0, key=f"input_l_{f_date_str}")
             with col_d:
-                in_d = st.number_input("夕食 (kcal)", min_value=0.0, value=float(st.session_state.ai_d), step=50.0, key="input_d")
+                in_d = st.number_input("夕食 (kcal)", min_value=0.0, value=float(st.session_state.ai_d), step=50.0, key=f"input_d_{f_date_str}")
             with col_s:
-                in_s = st.number_input("間食 (kcal)", min_value=0.0, value=float(st.session_state.ai_s), step=50.0, key="input_s")
+                in_s = st.number_input("間食 (kcal)", min_value=0.0, value=float(st.session_state.ai_s), step=50.0, key=f"input_s_{f_date_str}")
 
             st.session_state.ai_b = in_b
             st.session_state.ai_l = in_l
@@ -1014,13 +1020,8 @@ def main():
             st.rerun()
         st.divider()
         red_banner("本日の筋トレ記録")
-        logs_res = supabase.table("workout_logs").select("id, exercise, weight, reps").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
-        
-        if logs_res.data:
-            logs_df = pd.DataFrame(logs_res.data)
-            cards_html = ""
         # --- 本日の筋トレ記録データ取得 ---
-        w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", work_date).order("id").execute()
+        w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
         workout_df = pd.DataFrame(w_res.data) if w_res.data else pd.DataFrame()
 
         if not workout_df.empty:
@@ -1083,7 +1084,6 @@ def main():
                         st.rerun() 
 
                 st.divider()
-            st.markdown(cards_html, unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
 
