@@ -9,6 +9,7 @@ import streamlit as st
 from google import genai
 from supabase import create_client, Client
 
+
 # CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
 st.markdown(
     """
@@ -813,21 +814,18 @@ def main():
         if not p_api_key:
             st.warning("左側のサイドバー（ユーザー設定）に Gemini API キーを入力してください。")
         else:
-            c1, c2 = st.columns(2)
-            with c1:
-                meal_category = st.selectbox(
-                    "追加先区分",
-                    ["朝食", "昼食", "夕食", "間食"],
-                    key="target_meal_category"
-                )
-            with c2:
-                img_source = st.radio("入力方法", ["カメラ撮影", "画像ファイル選択"], horizontal=True)
+            # 追加先区分の選択のみに変更
+            meal_category = st.selectbox(
+                "追加先区分",
+                ["朝食", "昼食", "夕食", "間食"],
+                key="target_meal_category"
+            )
 
-            uploaded_img = None
-            if img_source == "カメラ撮影":
-                uploaded_img = st.camera_input("料理を撮影してください")
-            else:
-                uploaded_img = st.file_uploader("画像を選択してください", type=["jpg", "jpeg", "png", "webp"])
+            # file_uploaderのみに統一（スマホから写真ライブラリ・標準カメラ選択が可能）
+            uploaded_img = st.file_uploader(
+                "画像を選択またはカメラで撮影", 
+                type=["jpg", "jpeg", "png", "webp"]
+            )
 
             if uploaded_img is not None:
                 image = Image.open(uploaded_img)
@@ -842,7 +840,6 @@ def main():
                             added_cal = float(result.get("total_calories", 0))
                             dish_name = result.get("dish_name", "食事")
 
-                            # 選択した区分に自動加算
                             new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
                             if meal_category == "朝食":
                                 new_b += added_cal
@@ -853,7 +850,6 @@ def main():
                             else:
                                 new_s += added_cal
 
-                            # DBに保存（UPSERT）
                             food_data = {
                                 "user_id": user_id,
                                 "date": f_date_str,
