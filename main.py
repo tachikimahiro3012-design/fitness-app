@@ -276,10 +276,6 @@ def inject_theme_css():
             color: #111827 !important;
         }
 
-        div[data-testid="stHorizontalBlock"] {
-            flex-wrap: wrap !important;
-        }
-
         .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
         .ex-card-header { background: var(--brand-red); color: #fff; font-weight: 700;
                            padding: 8px 12px; font-size: 0.95rem; }
