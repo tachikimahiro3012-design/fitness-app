@@ -9,6 +9,48 @@ import streamlit as st
 from google import genai
 from supabase import create_client, Client
 
+# CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
+st.markdown(
+    """
+    <style>
+    /* 1. 画面遷移・ロード時の白く曇るオーバーレイとくるくるアニメーションを非表示 */
+    div[data-testid="stStatusWidget"] {
+        visibility: hidden;
+        display: none;
+    }
+    div[data-testid="stApp"] > div:first-child {
+        opacity: 1 !important;
+    }
+    .stApp > header {
+        background-color: transparent;
+    }
+    /* ロード中の薄暗いオーバーレイ要素を無効化 */
+    div[class*="st-"] {
+        transition: none !important;
+    }
+    div[data-aria-clear="true"] {
+        opacity: 1 !important;
+    }
+
+    /* 2. 画面幅が狭い端末（スマホ）でもカラムの横並びを維持する */
+    [data-testid="stHorizontalBlock"] {
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        overflow-x: auto;
+    }
+    
+    [data-testid="stColumn"] {
+        min-width: 0px !important;
+    }
+
+    div[data-testid="stNumberInput"] {
+        min-width: 60px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # --------------------------------------------------
 # ページ基本設定
 # --------------------------------------------------
@@ -294,7 +336,7 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
   )
 
   # 数値（メトリクス）表示
-  c1, c2, c3, c4 = st.columns(4)
+  c1, c2, c3, c4 = (4)
   c1.metric("Max Weight", f"{daily_summary['max_weight'].max():.1f} kg")
   c2.metric("Max Reps", f"{int(daily_summary['max_reps'].max())} 回")
   c3.metric("Max 1RM", f"{daily_summary['max_1rm'].max():.1f} kg")
@@ -740,105 +782,112 @@ def main():
         )
 
     # --------------------------------------------------
-    # 画面2: 食事記録（AIカメラ機能付き）
+    # 画面2: 食事記録（AIカメラ ＋ 自動加算）
     # --------------------------------------------------
     elif st.session_state.view == "food":
-        red_banner("食事カロリー入力")
+        red_banner("食事カロリー記録")
 
         food_date = st.date_input("記録日", value=st.session_state.target_date)
         st.session_state.target_date = food_date
         f_date_str = food_date.strftime("%Y-%m-%d")
 
-        f_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", f_date_str).execute()
-        f_row = f_res.data[0] if f_res.data else None
+        # 該当日の既存ログを取得
+        f_res = (
+            supabase.table("food_logs")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("date", f_date_str)
+            .execute()
+        )
+        f_row = f_res.data[0] if f_res.data else {}
 
-        if "last_food_date" not in st.session_state or st.session_state.last_food_date != f_date_str:
-            st.session_state.last_food_date = f_date_str
-            st.session_state.ai_b = f_row.get("breakfast_cal", 0.0) if f_row else 0.0
-            st.session_state.ai_l = f_row.get("lunch_cal", 0.0) if f_row else 0.0
-            st.session_state.ai_d = f_row.get("dinner_cal", 0.0) if f_row else 0.0
-            st.session_state.ai_s = f_row.get("snack_cal", 0.0) if f_row else 0.0
+        current_b = float(f_row.get("breakfast_cal", 0.0) or 0.0)
+        current_l = float(f_row.get("lunch_cal", 0.0) or 0.0)
+        current_d = float(f_row.get("dinner_cal", 0.0) or 0.0)
+        current_s = float(f_row.get("snack_cal", 0.0) or 0.0)
 
-        tab1, tab2 = st.tabs(["手入力", "AIカメラ/写真解析"])
-
-        with tab2:
-            st.markdown("#### 写真からカロリーを推定")
-            if not p_api_key:
-                st.warning("左側のサイドバーメニュー（ユーザー設定）に Gemini API キーを入力してください。")
-            else:
+        # --------------------------------------------------
+        # 1. AI写真解析 ＆ 自動加算エリア
+        # --------------------------------------------------
+        st.markdown("#### 写真から自動加算")
+        if not p_api_key:
+            st.warning("左側のサイドバー（ユーザー設定）に Gemini API キーを入力してください。")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                meal_category = st.selectbox(
+                    "追加先区分",
+                    ["朝食", "昼食", "夕食", "間食"],
+                    key="target_meal_category"
+                )
+            with c2:
                 img_source = st.radio("入力方法", ["カメラ撮影", "画像ファイル選択"], horizontal=True)
-                uploaded_img = None
 
-                if img_source == "カメラ撮影":
-                    uploaded_img = st.camera_input("料理を撮影してください")
-                else:
-                    uploaded_img = st.file_uploader("画像を選択してください", type=["jpg", "jpeg", "png", "webp"])
+            uploaded_img = None
+            if img_source == "カメラ撮影":
+                uploaded_img = st.camera_input("料理を撮影してください")
+            else:
+                uploaded_img = st.file_uploader("画像を選択してください", type=["jpg", "jpeg", "png", "webp"])
 
-                if uploaded_img is not None:
-                    image = Image.open(uploaded_img)
-                    st.image(image, caption="解析対象の画像", use_container_width=True)
+            if uploaded_img is not None:
+                image = Image.open(uploaded_img)
+                st.image(image, caption="解析対象", use_container_width=True)
 
-                    if st.button("AIでカロリーを判定", type="primary"):
-                        with st.spinner("AIが食事内容とカロリーを解析中..."):
-                            result, error = analyze_food_image(image, p_api_key)
-                            if error:
-                                st.error(f"解析エラー: {error}")
-                            else:
-                                st.session_state.ai_result = result
-
-                if "ai_result" in st.session_state:
-                    res = st.session_state.ai_result
-                    st.success("解析が完了しました！")
-                    st.write(f"**料理名:** {res.get('dish_name')}")
-                    st.write(f"**推定カロリー:** 約 {res.get('total_calories')} kcal")
-                    st.write(f"**推奨区分:** {res.get('meal_type')}")
-                    st.caption(f"メモ: {res.get('description')}")
-
-                    if st.button("この結果を入力欄に反映する"):
-                        m_type = res.get("meal_type")
-                        c_val = float(res.get("total_calories", 0))
-
-                        if m_type == "朝食":
-                            st.session_state.ai_b = c_val
-                        elif m_type == "昼食":
-                            st.session_state.ai_l = c_val
-                        elif m_type == "夕食":
-                            st.session_state.ai_d = c_val
+                if st.button("AI解析してカロリーを自動加算する", type="primary", use_container_width=True):
+                    with st.spinner("AIが料理とカロリーを解析中..."):
+                        result, error = analyze_food_image(image, p_api_key)
+                        if error:
+                            st.error(f"解析エラー: {error}")
                         else:
-                            st.session_state.ai_s = c_val
+                            added_cal = float(result.get("total_calories", 0))
+                            dish_name = result.get("dish_name", "食事")
 
-                        st.success("入力欄に反映しました！「手入力」タブで保存を行ってください。")
+                            # 選択した区分に自動加算
+                            new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+                            if meal_category == "朝食":
+                                new_b += added_cal
+                            elif meal_category == "昼食":
+                                new_l += added_cal
+                            elif meal_category == "夕食":
+                                new_d += added_cal
+                            else:
+                                new_s += added_cal
 
-        with tab1:
-            col_b, col_l, col_d, col_s = st.columns(4)
-            with col_b:
-                in_b = st.number_input("朝食 (kcal)", min_value=0.0, value=float(st.session_state.ai_b), step=50.0, key=f"input_b_{f_date_str}")
-            with col_l:
-                in_l = st.number_input("昼食 (kcal)", min_value=0.0, value=float(st.session_state.ai_l), step=50.0, key=f"input_l_{f_date_str}")
-            with col_d:
-                in_d = st.number_input("夕食 (kcal)", min_value=0.0, value=float(st.session_state.ai_d), step=50.0, key=f"input_d_{f_date_str}")
-            with col_s:
-                in_s = st.number_input("間食 (kcal)", min_value=0.0, value=float(st.session_state.ai_s), step=50.0, key=f"input_s_{f_date_str}")
+                            # DBに保存（UPSERT）
+                            food_data = {
+                                "user_id": user_id,
+                                "date": f_date_str,
+                                "breakfast_cal": new_b,
+                                "lunch_cal": new_l,
+                                "dinner_cal": new_d,
+                                "snack_cal": new_s,
+                            }
+                            supabase.table("food_logs").upsert(food_data, on_conflict="user_id,date").execute()
 
-            st.session_state.ai_b = in_b
-            st.session_state.ai_l = in_l
-            st.session_state.ai_d = in_d
-            st.session_state.ai_s = in_s
+                            st.success(f"【{meal_category}】「{dish_name}」（約{int(added_cal)} kcal）を自動加算して保存しました！")
+                            st.rerun()
 
-            sub_total = in_b + in_l + in_d + in_s
-            st.metric("本日の摂取合計", f"{int(sub_total)} kcal")
+        st.divider()
 
-            if st.button("食事記録を保存", type="primary"):
-                food_data = {
-                    "user_id": user_id,
-                    "date": f_date_str,
-                    "breakfast_cal": in_b,
-                    "lunch_cal": in_l,
-                    "dinner_cal": in_d,
-                    "snack_cal": in_s,
-                }
-                supabase.table("food_logs").upsert(food_data, on_conflict="user_id,date").execute()
-                st.success("食事記録を保存しました。")
+        # --------------------------------------------------
+        # 2. 現在の記録状況（確認＆リセット用）
+        # --------------------------------------------------
+        st.markdown("#### 本日の記録一覧")
+        
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("朝食", f"{int(current_b)} kcal" if current_b > 0 else "-")
+        m_col2.metric("昼食", f"{int(current_l)} kcal" if current_l > 0 else "-")
+        m_col3.metric("夕食", f"{int(current_d)} kcal" if current_d > 0 else "-")
+        m_col4.metric("間食", f"{int(current_s)} kcal" if current_s > 0 else "-")
+
+        sub_total = current_b + current_l + current_d + current_s
+        st.metric("本日の合計摂取カロリー", f"{int(sub_total)} kcal")
+
+        # 万が一の誤記録用：リセット機能
+        with st.expander("本日の記録をやり直す（リセット）"):
+            if st.button("本日の食事記録を全消去する", type="secondary"):
+                supabase.table("food_logs").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
+                st.toast("本日の食事記録をクリアしました。")
                 st.rerun()
 
     # --------------------------------------------------
@@ -848,22 +897,72 @@ def main():
         red_banner("筋トレログ & 消費カロリー推定")
 
         red_banner("① セッション全体の設定")
+
+        # 今日の日付（デフォルト）を取得
+        work_date_default = st.session_state.get("target_date", datetime.date.today())
+        w_date_str_default = work_date_default.strftime("%Y-%m-%d")
+
+        # 既存のセッション設定（実施時間・運動強度）を DB から取得
+        existing_summary = (
+            supabase.table("daily_summaries")
+            .select("duration_min, intensity")
+            .eq("user_id", user_id)
+            .eq("date", w_date_str_default)
+            .execute()
+        )
+        saved_duration = None
+        saved_intensity_idx = 0
+        intensity_options = [
+            "標準 (通常のウェイトトレーニング)",
+            "軽度 (ストレッチ/自重/休憩長め)",
+            "高強度 (サーキット/高密度/スーパーセット)",
+        ]
+
+        if existing_summary.data:
+            dur_val = existing_summary.data[0].get("duration_min")
+            if dur_val is not None:
+                saved_duration = int(dur_val)
+            
+            intent_val = existing_summary.data[0].get("intensity")
+            if intent_val in intensity_options:
+                saved_intensity_idx = intensity_options.index(intent_val)
+
         col_dur, col_int = st.columns(2)
         with col_dur:
-            duration_input = st.number_input("全体実施時間 (分)", min_value=0, step=5, value=None, placeholder="0")
+            duration_input = st.number_input(
+                "全体実施時間 (分)",
+                min_value=0,
+                step=5,
+                value=saved_duration,
+                placeholder="0",
+                key="session_duration_input"
+            )
             duration = duration_input or 0
         with col_int:
             intensity = st.selectbox(
                 "運動強度",
-                [
-                    "標準 (通常のウェイトトレーニング)",
-                    "軽度 (ストレッチ/自重/休憩長め)",
-                    "高強度 (サーキット/高密度/スーパーセット)",
-                ],
+                intensity_options,
+                index=saved_intensity_idx,
+                key="session_intensity_select"
             )
 
         estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
         st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+
+        # 【追加】セッション設定の保存ボタン
+        if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
+            try:
+                supabase.table("daily_summaries").upsert({
+                    "user_id": user_id,
+                    "date": w_date_str_default,
+                    "duration_min": duration,
+                    "intensity": intensity,
+                    "workout_burned_calories": estimated_burn,
+                }, on_conflict="user_id,date").execute()
+                st.toast("セッション時間と消費カロリーを保存しました！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存時にエラーが発生しました: {e}")
 
         st.divider()
         red_banner("② 種目の記録")
@@ -873,38 +972,134 @@ def main():
             work_date = st.date_input("日付", value=st.session_state.target_date, key="w_date")
             st.session_state.target_date = work_date
             w_date_str = work_date.strftime("%Y-%m-%d")
+
+        # --- DB（user_profile）から前回選択した部位・種目を取得 ---
+        db_last_part = profile.get("last_part", "胸") if profile else "胸"
+        db_last_ex = profile.get("last_exercise", "ベンチプレス") if profile else "ベンチプレス"
+
+        part_list = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
+        part_index = part_list.index(db_last_part) if db_last_part in part_list else 0
+
+        # ① 部位セレクトボックスの変更検知コールバック
+        def on_part_change():
+            new_p = st.session_state["part_select_key"]
+            supabase.table("user_profile").upsert(
+                {"user_id": user_id, "last_part": new_p}
+            ).execute()
+
         with col_part:
-            part = st.selectbox("部位", ["胸", "二頭", "三頭", "背中", "肩", "脚"])
+            part = st.selectbox(
+                "部位", 
+                part_list, 
+                index=part_index, 
+                key="part_select_key", 
+                on_change=on_part_change
+            )
 
-
+        # --------------------------------------------------
+        # 【追加】選択部位の種目別「最終実施日・経過日数」一覧
+        # --------------------------------------------------
+        # 1. 選択された部位の種目一覧を取得
         ex_res = (
             supabase.table("exercises")
             .select("name")
             .eq("part", part)
             .execute()
         )
-        ex_list = (
-            [r["name"] for r in ex_res.data] if ex_res.data else []
-        )  #[cite: 9]
+        ex_list = [r["name"] for r in ex_res.data] if ex_res.data else []
 
-        # ドロップダウンの選択肢を作成
+        # 2. 該当部位の過去の最終実施日（MAX(date)）を取得
+        last_dates = {}
+        if ex_list:
+            logs_res = (
+                supabase.table("workout_logs")
+                .select("exercise, date")
+                .eq("user_id", user_id)
+                .eq("part", part)
+                .execute()
+            )
+            if logs_res.data:
+                for row in logs_res.data:
+                    ex_n = row["exercise"]
+                    d_str = row["date"]
+                    # 最新の日付を保持
+                    if ex_n not in last_dates or d_str > last_dates[ex_n]:
+                        last_dates[ex_n] = d_str
+
+        # --------------------------------------------------
+        # 部位ごとの「最終実施日・経過日数」一覧
+        # --------------------------------------------------
+        # 各部位の最新実施日を DB から取得
+        all_parts = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
+        
+        part_last_dates = {}
+        part_logs = (
+            supabase.table("workout_logs")
+            .select("part, date")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if part_logs.data:
+            for row in part_logs.data:
+                p_name = row["part"]
+                d_str = row["date"]
+                if p_name not in part_last_dates or d_str > part_last_dates[p_name]:
+                    part_last_dates[p_name] = d_str
+
+        # 部位ごとの経過日数をすっきり表示
+        with st.expander("各部位の前回実施からの経過日数", expanded=False):
+            today_obj = datetime.date.today()
+            
+            # 2列（または3列）でコンパクトに並べる
+            cols = st.columns(3)
+            for idx, p_item in enumerate(all_parts):
+                col = cols[idx % 3]
+                with col:
+                    if p_item in part_last_dates:
+                        last_d_obj = datetime.datetime.strptime(part_last_dates[p_item], "%Y-%m-%d").date()
+                        days_ago = (today_obj - last_d_obj).days
+                        
+                        if days_ago == 0:
+                            days_str = "本日実施"
+                        else:
+                            days_str = f"{days_ago}日前"
+                            
+                        st.markdown(f"**{p_item}**: {days_str}")
+                    else:
+                        st.markdown(f"**{p_item}**: 記録なし")
+            
+        # --------------------------------------------------
+        # 種目の選択ドロップダウン
+        # --------------------------------------------------
         add_option_text = "+ 新しい種目を追加..."
         options = ex_list + [add_option_text]
 
-        # 種目選択と削除ボタンを横並びにするレイアウト
+        ex_index = options.index(db_last_ex) if db_last_ex in options else 0
+
+        def on_exercise_change():
+            new_ex = st.session_state["exercise_select_key"]
+            if new_ex != add_option_text:
+                supabase.table("user_profile").upsert(
+                    {"user_id": user_id, "last_exercise": new_ex}
+                ).execute()
+
         col_select, col_del = st.columns([5, 1])
         with col_select:
-          exercise = st.selectbox("種目", options)
+            exercise = st.selectbox(
+                "種目", 
+                options, 
+                index=ex_index, 
+                key="exercise_select_key", 
+                on_change=on_exercise_change
+            )
 
         with col_del:
-          st.write("")  # 位置調整用の余白
-          st.write("")
-          # 「新規種目を追加...」以外が選ばれている場合のみ削除ボタンを表示
-          if exercise != add_option_text and ex_list:
-            if st.button("削除", key=f"btn_delete_start_{exercise}"):
-              # 1段階目の確認フラグを立てる
-              st.session_state[f"confirm_del_step1_{exercise}"] = True
-
+            st.write("")
+            st.write("")
+            if exercise != add_option_text and ex_list:
+                if st.button("削除", key=f"btn_delete_start_{exercise}"):
+                    st.session_state[f"confirm_del_step1_{exercise}"] = True
+        
         # --------------------------------------------------
         # 新規種目の追加処理
         # --------------------------------------------------
@@ -991,7 +1186,7 @@ def main():
             if exercise != "（種目がありません）":
             # 1. 各セットの記録（burned_calories は 0 で保存）
                 workout_data = {
-               "user_id": user_id,
+                "user_id": user_id,
                 "date": w_date_str,
                 "part": part,
                 "exercise": exercise,
@@ -1044,7 +1239,7 @@ def main():
 
                 for set_no, (_, row) in enumerate(group.iterrows(), start=1):
                     log_id = row["id"]
-                    c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 2])
+                    c1, c2, c3, c4, c5 = st.columns([0.8, 2.5, 2.5, 2.0, 1.0])
 
                     c1.write(f"**{set_no}**")
 
@@ -1068,7 +1263,6 @@ def main():
                             "reps": new_reps
                         }).eq("id", log_id).execute()
                         st.toast("記録を更新しました！")
-                        st.rerun()
 
                     # RMのリアルタイム計算表示
                     if new_reps > 0:
