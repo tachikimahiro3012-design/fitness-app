@@ -41,7 +41,7 @@ st.markdown(
     }
     
     [data-testid="stColumn"] {
-        min-width: 0px !important;
+        min-width: 42px !important;
     }
 
     div[data-testid="stNumberInput"] {
