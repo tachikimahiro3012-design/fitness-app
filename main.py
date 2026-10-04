@@ -181,7 +181,6 @@ def calculate_workout_burn(weight, duration_min, intensity):
     burn = (mets - 1.0) * weight * (duration_min / 60.0) * 1.05
     return round(burn, 1)
 
-# UI用CSS
 def inject_theme_css():
     st.markdown(
         """
@@ -289,6 +288,7 @@ def inject_theme_css():
         }
 
         div[data-testid="stColumn"] {
+            min-width: 0px !important; /* スマホ画面で崩れるのを防止 */
             padding: 0px 1px !important;
         }
 
