@@ -131,6 +131,36 @@ def analyze_food_image(image: Image.Image, api_key: str):
     except Exception as e:
         return None, str(e)
 
+# Gemini AIによるテキスト解析関数
+def analyze_food_text(text_input: str, api_key: str):
+  try:
+    client = genai.Client(api_key=api_key)
+    prompt = f"""
+        以下の食事テキストから、合計カロリー（kcal）と整理された料理名を推定してください。
+        テキスト: 「{text_input}」
+
+        回答は必ず以下の純粋なJSONフォーマットのみで出力してください。
+        {{
+            "dish_name": "簡潔な料理名（例: ゆで卵1個）",
+            "total_calories": 推定合計カロリー(数値のみ)
+        }}
+        """
+    response = client.models.generate_content(
+        model="gemini-3.6-flash", contents=[prompt]
+    )
+
+    text = response.text.strip()
+    if text.startswith("```json"):
+      text = text[7:]
+    if text.startswith("```"):
+      text = text[3:]
+    if text.endswith("```"):
+      text = text[:-3]
+
+    return json.loads(text.strip()), None
+  except Exception as e:
+    return None, str(e)
+  
 # BMR / TDEE / 目標カロリー計算
 def calculate_nutrition_targets(
     gender, age, height, weight, activity_level, steps, workout_burn, goal_phase
@@ -926,7 +956,7 @@ def main():
         )
 
 
-    # --------------------------------------------------
+        # --------------------------------------------------
     # 画面2: 食事記録（AI解析 / 手入力 / 定番履歴 / 個別修正・消去）
     # --------------------------------------------------
     elif st.session_state.view == "food":
@@ -965,57 +995,156 @@ def main():
                 food_data, on_conflict="user_id,date"
             ).execute()
 
-        # --- 1. 入力タブ（AI写真解析 / 手入力 / 定番メニュー） ---
+        # 明細を追加して合計も更新するヘルパー
+        def add_food_item(meal_type, dish_name, calories, source):
+            # 1. 明細を保存
+            supabase.table("food_items").insert({
+                "user_id": user_id,
+                "date": f_date_str,
+                "meal_type": meal_type,
+                "dish_name": dish_name,
+                "calories": float(calories),
+                "source": source,
+            }).execute()
+
+            # 2. 合計を更新
+            new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+            if meal_type == "朝食":
+                new_b += float(calories)
+            elif meal_type == "昼食":
+                new_l += float(calories)
+            elif meal_type == "夕食":
+                new_d += float(calories)
+            else:
+                new_s += float(calories)
+            update_food_log(new_b, new_l, new_d, new_s)
+
+        # --- 1. 入力タブ ---
         food_tab1, food_tab2, food_tab3 = st.tabs(
-            ["AI写真解析", "手入力・微調整", "定番・ショートカット"]
+            ["AI解析", "手入力・微調整", "定番・ショートカット"]
         )
 
-        # タブ1: AI写真解析
+                # =============================================
+        # タブ1: AI解析（写真 + 文章）
+        # =============================================
         with food_tab1:
             if not p_api_key:
                 st.warning("左側のサイドバー（ユーザー設定）に Gemini API キーを入力してください。")
             else:
-                meal_category_ai = st.selectbox(
-                    "追加先区分",
-                    ["朝食", "昼食", "夕食", "間食"],
-                    key="target_meal_category_ai",
-                )
-                uploaded_img = st.file_uploader(
-                    "画像を選択またはカメラで撮影",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    key="food_img_uploader",
+                analysis_mode = st.radio(
+                    "解析方法",
+                    ["写真で解析", "文章で解析"],
+                    horizontal=True,
+                    key="ai_analysis_mode",
                 )
 
-                if uploaded_img is not None:
-                    image = Image.open(uploaded_img)
-                    st.image(image, caption="解析対象", use_container_width=True)
+                # ---------- 写真で解析 ----------
+                if analysis_mode == "写真で解析":
+                    uploaded_img = st.file_uploader(
+                        "画像を選択またはカメラで撮影",
+                        type=["jpg", "jpeg", "png", "webp"],
+                        key="food_img_uploader",
+                    )
 
-                    if st.button("AI解析してカロリーを自動加算する", type="primary", use_container_width=True):
-                        with st.spinner("AIが料理とカロリーを解析中..."):
-                            result, error = analyze_food_image(image, p_api_key)
-                            if error:
-                                st.error(f"解析エラー: {error}")
-                            else:
-                                added_cal = float(result.get("total_calories", 0))
-                                dish_name = result.get("dish_name", "食事")
+                    if uploaded_img is not None:
+                        image = Image.open(uploaded_img)
+                        st.image(image, caption="解析対象", use_container_width=True)
 
-                                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
-                                if meal_category_ai == "朝食":
-                                    new_b += added_cal
-                                elif meal_category_ai == "昼食":
-                                    new_l += added_cal
-                                elif meal_category_ai == "夕食":
-                                    new_d += added_cal
+                        if st.button("AIでカロリーを推定する", type="primary", use_container_width=True, key="btn_analyze_image"):
+                            with st.spinner("AIが料理とカロリーを解析中..."):
+                                result, error = analyze_food_image(image, p_api_key)
+                                if error:
+                                    st.error(f"解析エラー: {error}")
                                 else:
-                                    new_s += added_cal
+                                    st.session_state["ai_image_result"] = result
 
-                                update_food_log(new_b, new_l, new_d, new_s)
-                                st.success(f"【{meal_category_ai}】「{dish_name}」（約{int(added_cal)} kcal）を加算しました！")
-                                st.rerun()
+                    # 推定結果の表示
+                    if "ai_image_result" in st.session_state and st.session_state["ai_image_result"]:
+                        result = st.session_state["ai_image_result"]
+                        dish_name = result.get("dish_name", "食事")
+                        added_cal = float(result.get("total_calories", 0))
+                        description = result.get("description", "")
 
+                        st.markdown("---")
+                        st.markdown("**推定結果**")
+                        st.markdown(f"- 料理名: **{dish_name}**")
+                        st.markdown(f"- 推定カロリー: **{int(added_cal)} kcal**")
+                        if description:
+                            st.caption(description)
+
+                        st.markdown("#### 追加先を選択")
+                        cols = st.columns(4)
+                        meal_types = ["朝食", "昼食", "夕食", "間食"]
+                        for i, mt in enumerate(meal_types):
+                            with cols[i]:
+                                if st.button(f"{mt}に追加", key=f"add_img_{mt}", use_container_width=True):
+                                    add_food_item(mt, dish_name, added_cal, "ai_image")
+                                    st.session_state["ai_image_result"] = None
+                                    st.success(f"【{mt}】「{dish_name}」（{int(added_cal)} kcal）を追加しました！")
+                                    st.rerun()
+
+                        if st.button("★ 定番メニューに保存", key="save_img_preset", use_container_width=True):
+                            supabase.table("user_presets").insert({
+                                "user_id": user_id,
+                                "name": dish_name,
+                                "calories": added_cal,
+                            }).execute()
+                            st.toast(f"「{dish_name}」を定番メニューに保存しました！")
+
+                # ---------- 文章で解析 ----------
+                else:
+                    text_input = st.text_area(
+                        "食べたものを文章で入力",
+                        placeholder="例: プロテイン1スクープとバナナ1本、ゆで卵2個",
+                        height=100,
+                        key="food_text_input",
+                    )
+
+                    if st.button("AIでカロリーを推定する", type="primary", use_container_width=True, key="btn_analyze_text"):
+                        if not text_input.strip():
+                            st.warning("文章を入力してください。")
+                        else:
+                            with st.spinner("AIがカロリーを推定中..."):
+                                result, error = analyze_food_text(text_input.strip(), p_api_key)
+                                if error:
+                                    st.error(f"解析エラー: {error}")
+                                else:
+                                    st.session_state["ai_text_result"] = result
+
+                    # 推定結果の表示
+                    if "ai_text_result" in st.session_state and st.session_state["ai_text_result"]:
+                        result = st.session_state["ai_text_result"]
+                        dish_name = result.get("dish_name", "食事")
+                        added_cal = float(result.get("total_calories", 0))
+
+                        st.markdown("---")
+                        st.markdown("**推定結果**")
+                        st.markdown(f"- 料理名: **{dish_name}**")
+                        st.markdown(f"- 推定カロリー: **{int(added_cal)} kcal**")
+
+                        st.markdown("#### 追加先を選択")
+                        cols = st.columns(4)
+                        meal_types = ["朝食", "昼食", "夕食", "間食"]
+                        for i, mt in enumerate(meal_types):
+                            with cols[i]:
+                                if st.button(f"{mt}に追加", key=f"add_text_{mt}", use_container_width=True):
+                                    add_food_item(mt, dish_name, added_cal, "ai_text")
+                                    st.session_state["ai_text_result"] = None
+                                    st.success(f"【{mt}】「{dish_name}」（{int(added_cal)} kcal）を追加しました！")
+                                    st.rerun()
+
+                        if st.button("★ 定番メニューに保存", key="save_text_preset", use_container_width=True):
+                            supabase.table("user_presets").insert({
+                                "user_id": user_id,
+                                "name": dish_name,
+                                "calories": added_cal,
+                            }).execute()
+                            st.toast(f"「{dish_name}」を定番メニューに保存しました！")
+        # =============================================
         # タブ2: 手入力・微調整
+        # =============================================
         with food_tab2:
-            st.caption("数値の直接入力や、AI解析結果の加算・差し引きができます。")
+            st.caption("数値の直接入力ができます。加算時は明細にも残ります。")
             m_cat_manual = st.selectbox("対象の食事区分", ["朝食", "昼食", "夕食", "間食"], key="manual_meal_cat")
 
             col_m1, col_m2 = st.columns(2)
@@ -1024,29 +1153,55 @@ def main():
             with col_m2:
                 input_mode = st.radio("記録方法", ["上書き設定", "現在の記録に加算"], index=1)
 
+            manual_name = st.text_input(
+                "料理名（任意・明細に残したい場合）",
+                placeholder="例: コンビニ弁当、プロテイン",
+                key="manual_dish_name",
+            )
+
             if st.button("手入力で反映する", type="primary", use_container_width=True):
-                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
-                
+                dish = manual_name.strip() if manual_name.strip() else "手入力"
+
                 if input_mode == "上書き設定":
+                    # 該当区分の明細を全削除してから、新しい値で1件作る
+                    supabase.table("food_items").delete().eq(
+                        "user_id", user_id
+                    ).eq("date", f_date_str).eq("meal_type", m_cat_manual).execute()
+
                     target_val = float(manual_cal)
+                    new_b = target_val if m_cat_manual == "朝食" else current_b
+                    new_l = target_val if m_cat_manual == "昼食" else current_l
+                    new_d = target_val if m_cat_manual == "夕食" else current_d
+                    new_s = target_val if m_cat_manual == "間食" else current_s
+                    update_food_log(new_b, new_l, new_d, new_s)
+
+                    if target_val > 0:
+                        supabase.table("food_items").insert({
+                            "user_id": user_id,
+                            "date": f_date_str,
+                            "meal_type": m_cat_manual,
+                            "dish_name": dish,
+                            "calories": target_val,
+                            "source": "manual",
+                        }).execute()
+
+                    st.toast(f"【{m_cat_manual}】を {int(target_val)} kcal に上書きしました！")
                 else:
-                    curr_val = {"朝食": current_b, "昼食": current_l, "夕食": current_d, "間食": current_s}[m_cat_manual]
-                    target_val = curr_val + float(manual_cal)
+                    # 加算 → 明細にも残す
+                    if manual_cal > 0:
+                        add_food_item(m_cat_manual, dish, float(manual_cal), "manual")
+                        st.toast(f"【{m_cat_manual}】に {int(manual_cal)} kcal を加算しました！")
+                    else:
+                        st.warning("カロリーを入力してください。")
 
-                if m_cat_manual == "朝食": new_b = target_val
-                elif m_cat_manual == "昼食": new_l = target_val
-                elif m_cat_manual == "夕食": new_d = target_val
-                else: new_s = target_val
-
-                update_food_log(new_b, new_l, new_d, new_s)
-                st.toast(f"【{m_cat_manual}】を {int(target_val)} kcal に更新しました！")
                 st.rerun()
 
-        # タブ3: 定番・ショートカット（ユーザー独自のカスタムプリセットに対応）
+        # =============================================
+        # タブ3: 定番・ショートカット
+        # =============================================
         with food_tab3:
             st.caption("よく食べるメニューをワンタップで追加したり、自分の定番メニューを登録・管理できます。")
 
-            # ユーザー独自のプリセット一覧をSupabaseから取得
             preset_res = (
                 supabase.table("user_presets")
                 .select("*")
@@ -1058,7 +1213,6 @@ def main():
 
             p_cat = st.selectbox("追加先", ["朝食", "昼食", "夕食", "間食"], key="preset_cat")
 
-            # 登録済みプリセットのボタン表示
             if custom_presets:
                 cols_p = st.columns(2)
                 for idx, item in enumerate(custom_presets):
@@ -1067,17 +1221,10 @@ def main():
                     p_cal = float(item["calories"])
 
                     with cols_p[idx % 2]:
-                        # ボタンと削除(×)ボタンを横並びに配置
                         col_btn, col_del = st.columns([4, 1])
                         with col_btn:
                             if st.button(f"+ {p_name} ({int(p_cal)}kcal)", key=f"preset_btn_{p_id}", use_container_width=True):
-                                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
-                                if p_cat == "朝食": new_b += p_cal
-                                elif p_cat == "昼食": new_l += p_cal
-                                elif p_cat == "夕食": new_d += p_cal
-                                else: new_s += p_cal
-
-                                update_food_log(new_b, new_l, new_d, new_s)
+                                add_food_item(p_cat, p_name, p_cal, "manual")
                                 st.toast(f"【{p_cat}】に {p_name} を追加しました！")
                                 st.rerun()
                         with col_del:
@@ -1090,7 +1237,6 @@ def main():
 
             st.divider()
 
-            # 新規定番メニューの登録フォーム
             with st.expander("＋ 新しい定番メニューを登録する"):
                 with st.form("add_preset_form", clear_on_submit=True):
                     new_p_name = st.text_input("メニュー名", placeholder="例: プロテイン1杯 + バナナ")
@@ -1111,7 +1257,9 @@ def main():
 
         st.divider()
 
-        # --- 2. 本日の記録一覧 ＆ 個別クリア・全リセット ---
+        # =============================================
+        # 本日の記録一覧（カード表示）
+        # =============================================
         st.markdown("#### 本日の記録一覧")
 
         categories = [
@@ -1121,7 +1269,6 @@ def main():
             ("間食", current_s, "snack"),
         ]
 
-        # CSS（1回だけ注入）
         st.markdown(
             """
             <style>
@@ -1163,7 +1310,6 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # HTMLカードを組み立て
         cards = []
         for label, val, _ in categories:
             display_val = f"{int(val)} kcal" if val > 0 else "-"
@@ -1173,7 +1319,6 @@ def main():
                 f'<div class="food-stat-value">{display_val}</div>'
                 f'</div>'
             )
-
         html = f'<div class="food-stat-grid">{"".join(cards)}</div>'
         st.markdown(html, unsafe_allow_html=True)
 
@@ -1187,8 +1332,9 @@ def main():
                         new_l = 0.0 if key_prefix == "lunch" else current_l
                         new_d = 0.0 if key_prefix == "dinner" else current_d
                         new_s = 0.0 if key_prefix == "snack" else current_s
-
                         update_food_log(new_b, new_l, new_d, new_s)
+                        # 該当区分の明細も削除
+                        supabase.table("food_items").delete().eq("user_id", user_id).eq("date", f_date_str).eq("meal_type", label).execute()
                         st.toast(f"{label}の記録を消去しました。")
                         st.rerun()
 
@@ -1196,9 +1342,52 @@ def main():
         sub_total = current_b + current_l + current_d + current_s
         st.metric("本日の合計摂取カロリー", f"{int(sub_total)} kcal")
 
+        # =============================================
+        # 本日の明細履歴
+        # =============================================
+        st.markdown("#### 本日の明細履歴")
+
+        items_res = (
+            supabase.table("food_items")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("date", f_date_str)
+            .order("created_at")
+            .execute()
+        )
+        items = items_res.data if items_res.data else []
+
+        if items:
+            for item in items:
+                item_id = item["id"]
+                col1, col2, col3 = st.columns([5, 2, 1])
+                with col1:
+                    source_icon = {"ai_image": "📷", "ai_text": "✏️", "manual": "📌"}.get(item["source"], "•")
+                    st.markdown(f"{source_icon} **{item['dish_name']}**（{item['meal_type']}）")
+                with col2:
+                    st.markdown(f"**{int(item['calories'])} kcal**")
+                with col3:
+                    if st.button("×", key=f"del_item_{item_id}", help="この明細を削除"):
+                        # 合計から差し引き
+                        cal = float(item["calories"])
+                        new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+                        mt = item["meal_type"]
+                        if mt == "朝食": new_b = max(0.0, new_b - cal)
+                        elif mt == "昼食": new_l = max(0.0, new_l - cal)
+                        elif mt == "夕食": new_d = max(0.0, new_d - cal)
+                        else: new_s = max(0.0, new_s - cal)
+                        update_food_log(new_b, new_l, new_d, new_s)
+                        # 明細削除
+                        supabase.table("food_items").delete().eq("id", item_id).execute()
+                        st.toast("明細を削除しました。")
+                        st.rerun()
+        else:
+            st.info("本日の明細はまだありません。")
+
         with st.expander("本日の記録をすべてリセット"):
             if st.button("全区分の食事記録をクリアする", type="secondary"):
                 supabase.table("food_logs").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
+                supabase.table("food_items").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
                 st.toast("本日の食事記録をすべてクリアしました。")
                 st.rerun()
 
