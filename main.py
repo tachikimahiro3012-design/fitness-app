@@ -1111,7 +1111,7 @@ def main():
 
         st.divider()
 
-        # --- 2. 本日の記録一覧 ＆ 個別クリア・全リセット（ここが1つだけにまとめられます） ---
+        # --- 2. 本日の記録一覧 ＆ 個別クリア・全リセット ---
         st.markdown("#### 本日の記録一覧")
 
         categories = [
@@ -1121,10 +1121,66 @@ def main():
             ("間食", current_s, "snack"),
         ]
 
+        # CSS（1回だけ注入）
+        st.markdown(
+            """
+            <style>
+            .food-stat-grid {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 6px;
+                margin-bottom: 8px;
+            }
+            .food-stat-card {
+                background: #f8f9fa;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 10px 6px;
+                text-align: center;
+            }
+            .food-stat-label {
+                font-size: 0.72rem;
+                color: #6b7280;
+                margin-bottom: 4px;
+            }
+            .food-stat-value {
+                font-size: 1.05rem;
+                font-weight: 700;
+                color: #111827;
+                line-height: 1.2;
+                white-space: nowrap;
+            }
+            @media (max-width: 480px) {
+                .food-stat-grid {
+                    grid-template-columns: repeat(2, 1fr);
+                }
+                .food-stat-value {
+                    font-size: 1.1rem;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # HTMLカードを組み立て
+        cards = []
+        for label, val, _ in categories:
+            display_val = f"{int(val)} kcal" if val > 0 else "-"
+            cards.append(
+                f'<div class="food-stat-card">'
+                f'<div class="food-stat-label">{label}</div>'
+                f'<div class="food-stat-value">{display_val}</div>'
+                f'</div>'
+            )
+
+        html = f'<div class="food-stat-grid">{"".join(cards)}</div>'
+        st.markdown(html, unsafe_allow_html=True)
+
+        # クリアボタン
         grid_cols = st.columns(4)
         for idx, (label, val, key_prefix) in enumerate(categories):
             with grid_cols[idx]:
-                st.metric(label, f"{int(val)} kcal" if val > 0 else "-")
                 if val > 0:
                     if st.button("クリア", key=f"clear_{key_prefix}", use_container_width=True):
                         new_b = 0.0 if key_prefix == "breakfast" else current_b
