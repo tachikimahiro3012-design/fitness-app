@@ -720,24 +720,130 @@ def main():
                 tot = (r.get("breakfast_cal") or 0) + (r.get("lunch_cal") or 0) + (r.get("dinner_cal") or 0) + (r.get("snack_cal") or 0)
                 food_cal_by_date[r["date"]] = tot
 
+        # --------------------------------------------------
+        # カレンダー用CSS（iOS風：日曜始まり／今日は赤丸／筋トレ日は青い点）
+        # --------------------------------------------------
         st.markdown(
             """
             <style>
-            .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 6px; }
-            .cal-head { text-align: center; font-weight: 700; font-size: 0.8rem; color: #6b7280; padding-bottom: 2px; }
-            .cal-cell { border-radius: 10px; padding: 6px 4px 8px; min-height: 62px; background: #f8f9fa;
-                        border: 1px solid #e5e7eb; display: flex; flex-direction: column; align-items: center; }
-            .cal-cell.empty { background: transparent; border: none; }
-            .cal-cell.today { border: 2px solid var(--brand-red); }
-            .cal-day-num { font-weight: 700; font-size: 0.85rem; color: #111827; }
-            .cal-workout-dot { width: 7px; height: 7px; border-radius: 50%; background: #f97316; margin-top: 3px; }
-            .cal-no-dot { width: 7px; height: 7px; margin-top: 3px; }
-            .cal-cal-num { margin-top: 4px; font-size: 0.68rem; font-weight: 700; line-height: 1; }
-            .cal-cal-num.under { color: #16a34a; }
-            .cal-cal-num.over { color: #dc2626; }
-            .cal-cal-num.none { color: #9ca3af; }
-            .cal-legend { display: flex; gap: 16px; margin-top: 10px; font-size: 0.75rem; color: #6b7280; align-items: center; flex-wrap: wrap; }
-            .cal-legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #f97316; display: inline-block; margin-right: 4px; }
+            /* ===== スマホ向けカレンダー（iOS風）===== */
+            .st-key-cal_area {
+                --cal-sun: #d93025;
+                --cal-sat: #1a62c9;
+                --cal-dot: #1a73e8;
+                --cal-today: #e63946;
+                --cal-line: #e5e7eb;
+                gap: 0 !important;
+            }
+            .st-key-cal_area div[data-testid="stVerticalBlock"],
+            .st-key-cal_area div[data-testid="stHorizontalBlock"] {
+                gap: 0 !important;
+            }
+            .st-key-cal_area div[data-testid="stColumn"] {
+                padding: 0 !important;
+            }
+
+            /* 曜日ヘッダー */
+            .cal-dow-row {
+                display: grid;
+                grid-template-columns: repeat(7, 1fr);
+                width: 100%;
+                /* st.markdown は下に -1rem の余白を持ち、次の行が上に食い込むため、その分を相殺 */
+                padding-bottom: 1rem;
+            }
+            .cal-dow {
+                text-align: center;
+                font-weight: 700;
+                font-size: 0.85rem;
+                line-height: 1.2;
+                color: #374151;
+                padding: 8px 0 4px;
+            }
+            .cal-dow.sun { color: var(--cal-sun); }
+            .cal-dow.sat { color: var(--cal-sat); }
+
+            /* 日付セル（ボタンを枠なしのセルとして描画） */
+            .st-key-cal_area div[data-testid="stColumn"] button {
+                position: relative;
+                width: 100% !important;
+                height: 64px !important;
+                min-height: 64px !important;
+                padding: 5px 0 0 !important;
+                border: none !important;
+                border-top: 1px solid var(--cal-line) !important;
+                border-radius: 0 !important;
+                background: transparent !important;
+                box-shadow: none !important;
+                display: flex !important;
+                align-items: flex-start !important;
+                justify-content: center !important;
+            }
+            .st-key-cal_area div[data-testid="stColumn"] button:hover {
+                background: #f3f4f6 !important;
+            }
+            .st-key-cal_area div[data-testid="stColumn"] button p {
+                position: relative;
+                z-index: 1;
+                margin: 0 !important;
+                text-align: center;
+                white-space: pre-line !important;
+                word-break: normal !important;
+                font-size: 10px !important;
+                font-weight: 600 !important;
+                line-height: 1.35 !important;
+                color: #9ca3af !important;               /* 摂取カロリー無しの色 */
+            }
+            /* 1行目＝日付の数字 */
+            .st-key-cal_area div[data-testid="stColumn"] button p::first-line {
+                font-size: 15px;
+                font-weight: 500;
+                color: #111827;
+            }
+
+            /* 日曜＝赤 / 土曜＝青 */
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_sun_"] button p::first-line { color: var(--cal-sun); }
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_sat_"] button p::first-line { color: var(--cal-sat); }
+
+            /* 前月・翌月の日付（薄く・押せない） */
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_out_"] button { opacity: 1 !important; cursor: default; }
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_out_"] button:hover { background: transparent !important; }
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_out_"] button p::first-line { color: #d1d5db; }
+
+            /* 今日＝赤い丸 */
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_td_"] button::before {
+                content: "";
+                position: absolute;
+                top: 3px;
+                left: 50%;
+                width: 24px;
+                height: 24px;
+                margin-left: -12px;
+                border-radius: 50%;
+                background: var(--cal-today);
+            }
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_td_"] button p::first-line { color: #ffffff; font-weight: 700; }
+
+            /* 筋トレした日＝数字の下に青い点 */
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_wk_"] button::after {
+                content: "";
+                position: absolute;
+                top: 30px;
+                left: 50%;
+                width: 5px;
+                height: 5px;
+                margin-left: -2.5px;
+                border-radius: 50%;
+                background: var(--cal-dot);
+            }
+
+            /* 摂取カロリー（目標以内＝緑 / オーバー＝赤） */
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_un_"] button p { color: #16a34a !important; }
+            .st-key-cal_area div[data-testid="stColumn"] [class*="_ov_"] button p { color: #dc2626 !important; }
+
+            /* 凡例 */
+            .cal-legend { display: flex; gap: 14px; margin-top: 10px; font-size: 0.75rem; color: #6b7280; align-items: center; flex-wrap: wrap; }
+            .cal-legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #1a73e8; display: inline-block; margin-right: 4px; }
+            .cal-legend-today { width: 14px; height: 14px; border-radius: 50%; background: #e63946; color: #fff; display: inline-block; margin-right: 4px; font-size: 0.6rem; line-height: 14px; text-align: center; font-weight: 700; }
             .cal-legend-num.under { color: #16a34a; font-weight: 700; }
             .cal-legend-num.over { color: #dc2626; font-weight: 700; }
             </style>
@@ -746,49 +852,71 @@ def main():
         )
 
         # --------------------------------------------------
-        # カレンダー描画（ボタン形式へ変更）
+        # カレンダー描画（日付ボタンを枠なしのセルとして表示）
+        #   キー末尾のフラグ(_sun_ / _sat_ / _out_ / _td_ / _wk_ / _un_ / _ov_)を
+        #   CSS側で拾って、色・点・丸を切り替えている
         # --------------------------------------------------
         days_abbr = ["日", "月", "火", "水", "木", "金", "土"]
-        h_cols = st.columns(7)
-        for idx, d_name in enumerate(days_abbr):
-            h_cols[idx].markdown(f"**<div style='text-align:center;'>{d_name}</div>**", unsafe_allow_html=True)
+        NBSP = "\u00a0"
 
-        month_cal = calendar.monthcalendar(cal_y, cal_m)
-        for week in month_cal:
-            w_cols = st.columns(7)
-            for idx, day in enumerate(week):
-                if day == 0:
-                    w_cols[idx].write("")
-                    continue
+        with st.container(key="cal_area"):
+            # 曜日見出し（列ではなく1つのHTML行として描画し、見切れを防ぐ）
+            dow_html = "".join(
+                f"<div class='cal-dow {'sun' if i == 0 else 'sat' if i == 6 else ''}'>{n}</div>"
+                for i, n in enumerate(days_abbr)
+            )
+            st.markdown(
+                f"<div class='cal-dow-row'>{dow_html}</div>",
+                unsafe_allow_html=True,
+            )
 
-                date_obj = datetime.date(cal_y, cal_m, day)
-                date_str = date_obj.strftime("%Y-%m-%d")
+            # 日曜始まり（前月・翌月の日付も含めて週ごとに取得）
+            cal = calendar.Calendar(firstweekday=6)
+            for week in cal.monthdatescalendar(cal_y, cal_m):
+                w_cols = st.columns(7)
+                for idx, date_obj in enumerate(week):
+                    date_str = date_obj.strftime("%Y-%m-%d")
+                    is_out = date_obj.month != cal_m
 
-                has_workout = date_str in recorded_dates
-                cal_total = food_cal_by_date.get(date_str)
+                    flags = []
+                    if idx == 0:
+                        flags.append("sun")
+                    if idx == 6:
+                        flags.append("sat")
 
-                # ボタンに表示するテキスト
-                label_parts = [f"{day}"]
-                if has_workout:
-                    label_parts.append("●")
-                if cal_total is not None:
-                    label_parts.append(f"{int(cal_total)}k")
-
-                btn_label = " ".join(label_parts)
-
-                # 日付ボタンを配置
-                if w_cols[idx].button(btn_label, key=f"cal_btn_{date_str}", use_container_width=True):
-                    st.session_state.target_date = date_obj
-                    # 筋トレ記録があれば「筋トレ記録」画面へ、なければ「食事記録」画面へ直接ジャンプ
-                    if has_workout:
-                        st.session_state.view = "workout"
+                    if is_out:
+                        # 前月・翌月の日付は薄く表示するだけ（押せない）
+                        flags.append("out")
+                        has_workout = False
+                        cal_total = None
                     else:
-                        st.session_state.view = "food"
-                    st.rerun()
-  
+                        has_workout = date_str in recorded_dates
+                        cal_total = food_cal_by_date.get(date_str)
+                        if date_obj == now:
+                            flags.append("td")
+                        if has_workout:
+                            flags.append("wk")
+                        if cal_total is not None:
+                            flags.append("ov" if cal_total > target_cal else "un")
+
+                    # 1行目=日付 / 2行目=青い点の置き場（空行） / 3行目=摂取カロリー
+                    kcal_line = f"{int(cal_total)}k" if cal_total is not None else NBSP
+                    btn_label = f"{date_obj.day}\n{NBSP}\n{kcal_line}"
+                    btn_key = f"cal_btn_{date_str}_{'_'.join(flags)}_"
+
+                    if w_cols[idx].button(btn_label, key=btn_key, use_container_width=True, disabled=is_out):
+                        st.session_state.target_date = date_obj
+                        # 筋トレ記録があれば「筋トレ記録」画面へ、なければ「食事記録」画面へ直接ジャンプ
+                        if has_workout:
+                            st.session_state.view = "workout"
+                        else:
+                            st.session_state.view = "food"
+                        st.rerun()
+
         st.markdown(
             """
             <div class="cal-legend">
+                <span><span class="cal-legend-today"></span>今日</span>
                 <span><span class="cal-legend-dot"></span>筋トレした日</span>
                 <span><span class="cal-legend-num under">数字</span> = 摂取カロリー(目標以内)</span>
                 <span><span class="cal-legend-num over">数字</span> = 摂取カロリー(目標オーバー)</span>
@@ -796,6 +924,7 @@ def main():
             """,
             unsafe_allow_html=True,
         )
+
 
     # --------------------------------------------------
     # 画面2: 食事記録（AI解析 / 手入力 / 定番履歴 / 個別修正・消去）
@@ -836,18 +965,15 @@ def main():
                 food_data, on_conflict="user_id,date"
             ).execute()
 
-        # 入力モード選択タブ（AI写真解析 / 手入力 / 定番・履歴記録）
+        # --- 1. 入力タブ（AI写真解析 / 手入力 / 定番メニュー） ---
         food_tab1, food_tab2, food_tab3 = st.tabs(
             ["AI写真解析", "手入力・微調整", "定番・ショートカット"]
         )
 
-        # --- タブ1: AI写真解析 ---
+        # タブ1: AI写真解析
         with food_tab1:
             if not p_api_key:
-                st.warning(
-                    "左側のサイドバー（ユーザー設定）に Gemini API"
-                    " キーを入力してください。"
-                )
+                st.warning("左側のサイドバー（ユーザー設定）に Gemini API キーを入力してください。")
             else:
                 meal_category_ai = st.selectbox(
                     "追加先区分",
@@ -864,174 +990,160 @@ def main():
                     image = Image.open(uploaded_img)
                     st.image(image, caption="解析対象", use_container_width=True)
 
-                    if st.button(
-                        "AI解析してカロリーを自動加算する",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                      with st.spinner("AIが料理とカロリーを解析中..."):
-                        result, error = analyze_food_image(image, p_api_key)
-                        if error:
-                          st.error(f"解析エラー: {error}")
-                        else:
-                          added_cal = float(result.get("total_calories", 0))
-                          dish_name = result.get("dish_name", "食事")
+                    if st.button("AI解析してカロリーを自動加算する", type="primary", use_container_width=True):
+                        with st.spinner("AIが料理とカロリーを解析中..."):
+                            result, error = analyze_food_image(image, p_api_key)
+                            if error:
+                                st.error(f"解析エラー: {error}")
+                            else:
+                                added_cal = float(result.get("total_calories", 0))
+                                dish_name = result.get("dish_name", "食事")
 
-                          new_b, new_l, new_d, new_s = (
-                              current_b,
-                              current_l,
-                              current_d,
-                              current_s,
-                          )
-                          if meal_category_ai == "朝食":
-                            new_b += added_cal
-                          elif meal_category_ai == "昼食":
-                            new_l += added_cal
-                          elif meal_category_ai == "夕食":
-                            new_d += added_cal
-                          else:
-                            new_s += added_cal
+                                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+                                if meal_category_ai == "朝食":
+                                    new_b += added_cal
+                                elif meal_category_ai == "昼食":
+                                    new_l += added_cal
+                                elif meal_category_ai == "夕食":
+                                    new_d += added_cal
+                                else:
+                                    new_s += added_cal
 
-                          update_food_log(new_b, new_l, new_d, new_s)
-                          st.success(
-                              f"【{meal_category_ai}】「{dish_name}」（約{int(added_cal)}"
-                              " kcal）を自動加算して保存しました！"
-                          )
-                          st.rerun()
+                                update_food_log(new_b, new_l, new_d, new_s)
+                                st.success(f"【{meal_category_ai}】「{dish_name}」（約{int(added_cal)} kcal）を加算しました！")
+                                st.rerun()
 
-        # --- タブ2: 手入力・微調整 ---
+        # タブ2: 手入力・微調整
         with food_tab2:
             st.caption("数値の直接入力や、AI解析結果の加算・差し引きができます。")
-            m_cat_manual = st.selectbox(
-                "対象の食事区分",
-                ["朝食", "昼食", "夕食", "間食"],
-                key="manual_meal_cat",
-            )
+            m_cat_manual = st.selectbox("対象の食事区分", ["朝食", "昼食", "夕食", "間食"], key="manual_meal_cat")
 
             col_m1, col_m2 = st.columns(2)
             with col_m1:
-              manual_cal = st.number_input(
-                  "カロリー (kcal)", min_value=0, step=10, value=300
-              )
+                manual_cal = st.number_input("カロリー (kcal)", min_value=0, step=10, value=0)
             with col_m2:
-              input_mode = st.radio(
-                  "記録方法", ["上書き設定", "現在の記録に加算"], index=1
-              )
+                input_mode = st.radio("記録方法", ["上書き設定", "現在の記録に加算"], index=1)
 
-            if st.button(
-                "手入力で反映する", type="primary", use_container_width=True
-            ):
-              new_b, new_l, new_d, new_s = (
-                  current_b,
-                  current_l,
-                  current_d,
-                  current_s,
-              )
+            if st.button("手入力で反映する", type="primary", use_container_width=True):
+                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+                
+                if input_mode == "上書き設定":
+                    target_val = float(manual_cal)
+                else:
+                    curr_val = {"朝食": current_b, "昼食": current_l, "夕食": current_d, "間食": current_s}[m_cat_manual]
+                    target_val = curr_val + float(manual_cal)
 
-              if input_mode == "上書き設定":
-                target_val = float(manual_cal)
-              else:
-                curr_val = {
-                    "朝食": current_b,
-                    "昼食": current_l,
-                    "夕食": current_d,
-                    "間食": current_s,
-                }[m_cat_manual]
-                target_val = curr_val + float(manual_cal)
+                if m_cat_manual == "朝食": new_b = target_val
+                elif m_cat_manual == "昼食": new_l = target_val
+                elif m_cat_manual == "夕食": new_d = target_val
+                else: new_s = target_val
 
-              if m_cat_manual == "朝食":
-                new_b = target_val
-              elif m_cat_manual == "昼食":
-                new_l = target_val
-              elif m_cat_manual == "夕食":
-                new_d = target_val
-              else:
-                new_s = target_val
+                update_food_log(new_b, new_l, new_d, new_s)
+                st.toast(f"【{m_cat_manual}】を {int(target_val)} kcal に更新しました！")
+                st.rerun()
 
-              update_food_log(new_b, new_l, new_d, new_s)
-              st.toast(
-                  f"【{m_cat_manual}】を {int(target_val)} kcal に更新しました！"
-              )
-              st.rerun()
-
-        # --- タブ3: 定番・ショートカット ---
+        # タブ3: 定番・ショートカット（ユーザー独自のカスタムプリセットに対応）
         with food_tab3:
-            st.caption("よく食べるメニューをワンタップで追加できます。")
-            preset_meals = {
-                "定番の朝食 (プロテイン+バナナ)": 300,
-                "和食朝食 (ご飯+納豆+卵)": 400,
-                "プロテイン 1杯": 120,
-                "コンビニおにぎり 1個": 180,
-                "ベースフード 1袋": 250,
-            }
+            st.caption("よく食べるメニューをワンタップで追加したり、自分の定番メニューを登録・管理できます。")
 
-            p_cat = st.selectbox(
-                "追加先", ["朝食", "昼食", "夕食", "間食"], key="preset_cat"
+            # ユーザー独自のプリセット一覧をSupabaseから取得
+            preset_res = (
+                supabase.table("user_presets")
+                .select("*")
+                .eq("user_id", user_id)
+                .order("id")
+                .execute()
             )
+            custom_presets = preset_res.data if preset_res.data else []
 
-            cols_p = st.columns(2)
-            for idx, (p_name, p_cal) in enumerate(preset_meals.items()):
-              with cols_p[idx % 2]:
-                if st.button(
-                    f"+ {p_name} ({p_cal}kcal)",
-                    key=f"preset_btn_{idx}",
-                    use_container_width=True,
-                ):
-                  new_b, new_l, new_d, new_s = (
-                      current_b,
-                      current_l,
-                      current_d,
-                      current_s,
-                  )
-                  if p_cat == "朝食":
-                    new_b += p_cal
-                  elif p_cat == "昼食":
-                    new_l += p_cal
-                  elif p_cat == "夕食":
-                    new_d += p_cal
-                  else:
-                    new_s += p_cal
+            p_cat = st.selectbox("追加先", ["朝食", "昼食", "夕食", "間食"], key="preset_cat")
 
-                  update_food_log(new_b, new_l, new_d, new_s)
-                  st.toast(f"【{p_cat}】に {p_name} を追加しました！")
-                  st.rerun()
+            # 登録済みプリセットのボタン表示
+            if custom_presets:
+                cols_p = st.columns(2)
+                for idx, item in enumerate(custom_presets):
+                    p_id = item["id"]
+                    p_name = item["name"]
+                    p_cal = float(item["calories"])
+
+                    with cols_p[idx % 2]:
+                        # ボタンと削除(×)ボタンを横並びに配置
+                        col_btn, col_del = st.columns([4, 1])
+                        with col_btn:
+                            if st.button(f"+ {p_name} ({int(p_cal)}kcal)", key=f"preset_btn_{p_id}", use_container_width=True):
+                                new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
+                                if p_cat == "朝食": new_b += p_cal
+                                elif p_cat == "昼食": new_l += p_cal
+                                elif p_cat == "夕食": new_d += p_cal
+                                else: new_s += p_cal
+
+                                update_food_log(new_b, new_l, new_d, new_s)
+                                st.toast(f"【{p_cat}】に {p_name} を追加しました！")
+                                st.rerun()
+                        with col_del:
+                            if st.button("×", key=f"del_preset_{p_id}", help="このプリセットを削除"):
+                                supabase.table("user_presets").delete().eq("id", p_id).execute()
+                                st.toast("定番メニューを削除しました。")
+                                st.rerun()
+            else:
+                st.info("登録された定番メニューがありません。下のフォームから登録してください。")
+
+            st.divider()
+
+            # 新規定番メニューの登録フォーム
+            with st.expander("＋ 新しい定番メニューを登録する"):
+                with st.form("add_preset_form", clear_on_submit=True):
+                    new_p_name = st.text_input("メニュー名", placeholder="例: プロテイン1杯 + バナナ")
+                    new_p_cal = st.number_input("カロリー (kcal)", min_value=0, step=10, value=200)
+                    submit_preset = st.form_submit_button("定番メニューに保存", type="primary")
+
+                    if submit_preset:
+                        if new_p_name.strip():
+                            supabase.table("user_presets").insert({
+                                "user_id": user_id,
+                                "name": new_p_name.strip(),
+                                "calories": new_p_cal
+                            }).execute()
+                            st.toast(f"「{new_p_name.strip()}」を定番メニューに登録しました！")
+                            st.rerun()
+                        else:
+                            st.warning("メニュー名を入力してください。")
 
         st.divider()
+
+        # --- 2. 本日の記録一覧 ＆ 個別クリア・全リセット（ここが1つだけにまとめられます） ---
+        st.markdown("#### 本日の記録一覧")
+
+        categories = [
+            ("朝食", current_b, "breakfast"),
+            ("昼食", current_l, "lunch"),
+            ("夕食", current_d, "dinner"),
+            ("間食", current_s, "snack"),
+        ]
+
+        grid_cols = st.columns(4)
+        for idx, (label, val, key_prefix) in enumerate(categories):
+            with grid_cols[idx]:
+                st.metric(label, f"{int(val)} kcal" if val > 0 else "-")
+                if val > 0:
+                    if st.button("クリア", key=f"clear_{key_prefix}", use_container_width=True):
+                        new_b = 0.0 if key_prefix == "breakfast" else current_b
+                        new_l = 0.0 if key_prefix == "lunch" else current_l
+                        new_d = 0.0 if key_prefix == "dinner" else current_d
+                        new_s = 0.0 if key_prefix == "snack" else current_s
+
+                        update_food_log(new_b, new_l, new_d, new_s)
+                        st.toast(f"{label}の記録を消去しました。")
+                        st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
         sub_total = current_b + current_l + current_d + current_s
         st.metric("本日の合計摂取カロリー", f"{int(sub_total)} kcal")
 
-        # 一括リセット機能
         with st.expander("本日の記録をすべてリセット"):
-          if st.button("全区分の食事記録をクリアする", type="secondary"):
-            supabase.table("food_logs").delete().eq("user_id", user_id).eq(
-                "date", f_date_str
-            ).execute()
-            st.toast("本日の食事記録をすべてクリアしました。")
-            st.rerun()
-
-        st.divider()
-
-        # --------------------------------------------------
-        # 2. 現在の記録状況（確認＆リセット用）
-        # --------------------------------------------------
-        st.markdown("#### 本日の記録一覧")
-        
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        m_col1.metric("朝食", f"{int(current_b)} kcal" if current_b > 0 else "-")
-        m_col2.metric("昼食", f"{int(current_l)} kcal" if current_l > 0 else "-")
-        m_col3.metric("夕食", f"{int(current_d)} kcal" if current_d > 0 else "-")
-        m_col4.metric("間食", f"{int(current_s)} kcal" if current_s > 0 else "-")
-
-        sub_total = current_b + current_l + current_d + current_s
-        st.metric("本日の合計摂取カロリー", f"{int(sub_total)} kcal")
-
-        # 万が一の誤記録用：リセット機能
-        with st.expander("本日の記録をやり直す（リセット）"):
-            if st.button("本日の食事記録を全消去する", type="secondary"):
+            if st.button("全区分の食事記録をクリアする", type="secondary"):
                 supabase.table("food_logs").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
-                st.toast("本日の食事記録をクリアしました。")
+                st.toast("本日の食事記録をすべてクリアしました。")
                 st.rerun()
 
     # --------------------------------------------------
