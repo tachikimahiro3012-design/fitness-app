@@ -4,10 +4,17 @@ import json
 import os
 import pandas as pd
 import plotly.express as px
-from PIL import Image
+from PIL import Image, ImageOps
 import streamlit as st
 from google import genai
 from supabase import create_client, Client
+
+# サーバーの時刻設定(UTC等)に左右されないよう、「今日」は日本時間で決める
+JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def today_jst() -> datetime.date:
+    return datetime.datetime.now(JST).date()
 
 
 # --------------------------------------------------
@@ -175,6 +182,22 @@ def fetch_presets(user_id):
     return res.data if res.data else []
 
 
+def get_cardio_burn_total(user_id, date_str):
+    """その日の有酸素運動(part=有酸素)の消費カロリー合計。キャッシュしない"""
+    try:
+        res = (
+            supabase.table("workout_logs")
+            .select("burned_calories")
+            .eq("user_id", user_id)
+            .eq("date", date_str)
+            .eq("part", "有酸素")
+            .execute()
+        )
+        return sum(float(r.get("burned_calories") or 0) for r in (res.data or []))
+    except Exception:
+        return 0.0
+
+
 def invalidate_cache():
     for fn in (
         fetch_profile, fetch_food_row, fetch_summary, fetch_month_logs,
@@ -323,23 +346,18 @@ def analyze_food_text(text_input: str, api_key: str):
   
 # BMR / TDEE / 目標カロリー計算
 def calculate_nutrition_targets(
-    gender, age, height, weight, activity_level, steps, workout_burn, goal_phase
+    gender, age, height, weight, steps, workout_burn, goal_phase
 ):
     if gender == "男性":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
     else:
         bmr = 10 * weight + 6.25 * height - 5 * age - 161
 
-    # 1. 基本消費(日常活動レベルの倍率を反映)
-    act_multipliers = {
-        "デスクワーク中心": 1.2,
-        "週1〜2回運動": 1.375,
-        "週3〜4回運動": 1.55,
-        "週5回以上運動": 1.725,
-    }
-    base_tdee = bmr * act_multipliers.get(activity_level, 1.2)
+    # 1. 基本消費(デスクワーク相当の係数1.2のみ)
+    #    運動頻度の係数(1.375〜1.725)は、歩数加算や筋トレ消費と二重カウントになるため使わない
+    base_tdee = bmr * 1.2
 
-    # 2. 歩数による消費
+    # 2. 歩数による消費(日常の活動量はここで反映する)
     step_burn = steps * 0.03
 
     # 3. 筋トレによる消費
@@ -418,10 +436,13 @@ def inject_theme_css():
             background: var(--brand-red);
             color: #ffffff !important;
             font-weight: 700;
-            font-size: 1.05rem;
-            padding: 10px 14px;
-            border-radius: 10px;
-            margin: 18px 0 10px;
+            font-size: 0.95rem;
+            padding: 6px 12px;
+            border-radius: 8px;
+            margin: 12px 0 8px;
+            display: flex;
+            align-items: center;
+            line-height: 1.2;
         }
         .section-banner * {
             color: #ffffff !important;
@@ -464,13 +485,41 @@ def inject_theme_css():
             background-color: #e5e7eb !important;
             color: #111827 !important;
         }
+        .ex-card { 
+            border: 1px solid #e5e7eb; 
+            border-radius: 12px; 
+            overflow: hidden; 
+            margin-bottom: 14px; 
+        }
 
-        .ex-card { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
-        .ex-card-header { background: var(--brand-red); color: #fff; font-weight: 700;
-                           padding: 8px 12px; font-size: 0.95rem; }
-        .ex-set-row { display: grid; grid-template-columns: 0.5fr 1fr 1fr 1fr; padding: 6px 12px;
-                      font-size: 0.85rem; border-top: 1px solid #e5e7eb; color: #111827; }
-        .ex-set-row.head { font-weight: 700; color: #6b7280; font-size: 0.72rem; border-top: none; }
+        .ex-card-header { 
+            background: var(--brand-red) !important; 
+            color: #ffffff !important; 
+            font-weight: 700; 
+            padding: 10px 14px; 
+            font-size: 1.0rem; 
+            display: flex; 
+            align-items: center; 
+            justify-content: space-between; 
+        }
+
+        .ex-set-row { 
+            display: grid; 
+            grid-template-columns: 0.5fr 1fr 1fr 1fr; 
+            padding: 8px 12px; 
+            font-size: 0.85rem; 
+            border-top: 1px solid #e5e7eb; 
+            color: #111827; 
+        }
+
+        .ex-set-row.head { 
+            font-weight: 700; 
+            color: #6b7280; 
+            font-size: 0.72rem; 
+            border-top: none; 
+            background-color: #f9fafb; 
+        }
+
 
         /* --- 【追加】スマホ用カレンダーレイアウト最適化 --- */
         div[data-testid="stHorizontalBlock"] {
@@ -527,7 +576,7 @@ def calculate_cardio_burn(weight_kg, speed_kmh, incline_percent, duration_min):
 # --------------------------------------------------
 @st.dialog("種目別パフォーマンス分析", width="large")
 def show_exercise_analytics(user_id, exercise_name, supabase):
-  st.write(f"### {exercise_name}")
+  red_banner(exercise_name)
 
   # 該当種目の全履歴を取得
   res = (
@@ -593,6 +642,7 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
             name="最高重量 (kg)" if t.name == "max_weight" else "推定1RM (kg)"
         )
     )
+    fig.update_xaxes(type="category")
     st.plotly_chart(fig, use_container_width=True)
 
   with tab2:
@@ -603,6 +653,7 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
         labels={"total_volume": "総挙上量 (kg)", "date": "日付"},
         title="日別の総トレーニング負荷 (Volume)",
     )
+    fig_vol.update_xaxes(type="category")
     st.plotly_chart(fig_vol, use_container_width=True)
 
 def red_banner(text: str):
@@ -663,12 +714,11 @@ def main():
         p_age = profile.get("age", 20)
         p_height = profile.get("height", 170.0)
         p_weight = profile.get("weight", 65.0)
-        p_act = profile.get("activity_level", "週3〜4回運動")
         p_steps = profile.get("steps", 5000)
         p_goal = profile.get("goal_phase", "標準増量 (+300 kcal)")
     else:
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal = (
-            "男性", 25, 170.0, 65.0, "週3〜4回運動", 8000, "標準増量 (+300 kcal)"
+        p_gender, p_age, p_height, p_weight, p_steps, p_goal = (
+            "男性", 25, 170.0, 65.0, 8000, "標準増量 (+300 kcal)"
         )
 
     # サイドバー：設定
@@ -706,10 +756,6 @@ def main():
         height = st.number_input("身長 (cm)", min_value=50.0, max_value=250.0, value=float(p_height), step=0.5, format="%.1f")
         weight = st.number_input("体重 (kg)", min_value=20.0, max_value=300.0, value=float(p_weight), step=0.5, format="%.1f")
         
-        act_options = ["デスクワーク中心", "週1〜2回運動", "週3〜4回運動", "週5回以上運動"]
-        act_index = act_options.index(p_act) if p_act in act_options else 2
-        act_level = st.selectbox("日常活動レベル", act_options, index=act_index)
-        
         steps = st.number_input("1日の平均歩数", min_value=0, max_value=50000, value=int(p_steps), step=500)
         
         goal_options = [
@@ -730,7 +776,6 @@ def main():
                 "age": age,
                 "height": height,
                 "weight": weight,
-                "activity_level": act_level,
                 "steps": steps,
                 "goal_phase": goal_phase,
             }
@@ -740,9 +785,7 @@ def main():
             st.rerun()
 
     # 計算実行
-    # 以前は引数の並び順が関数定義とズレていて(活動レベルの文字列が
-    # steps の位置に入り、文字列×0.03でクラッシュしていた)、
-    # ここではキーワード引数にして取り違えが起きないようにしています。
+    # 引数の取り違えが起きないよう、キーワード引数で渡しています。
     # workout_burn は意図的に0固定にしています。目標摂取カロリー(TDEE)には
     # 筋トレ消費を含めず、代わりに「実質エネルギー収支」側でのみ筋トレ消費を
     # 差し引く方針にしたためです(目標値が一日の途中で動かないようにするため)。
@@ -751,13 +794,12 @@ def main():
         age=p_age,
         height=p_height,
         weight=p_weight,
-        activity_level=p_act,
         steps=p_steps,
         workout_burn=0,
         goal_phase=p_goal,
     )
 
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    today_str = today_jst().strftime("%Y-%m-%d")
 
     # 今日の食事記録を取得
     food_row = fetch_food_row(user_id, today_str)
@@ -817,13 +859,18 @@ def main():
     # --------------------------------------------------
     # 選択された日付の保持（初期値は今日）
     if "target_date" not in st.session_state:
-        st.session_state.target_date = datetime.date.today()
+        st.session_state.target_date = today_jst()
         
     if st.session_state.view == "dashboard":
         red_banner("今日の状態")
 
         offset_str = f"+{offset}" if offset > 0 else (f"{offset}" if offset < 0 else "±0")
         st.info(f"現在の設定: {p_goal} | 推定維持カロリー(TDEE): {tdee} kcal | 調整幅: {offset_str} kcal")
+        if target_cal < bmr:
+            st.warning(
+                f"目標摂取カロリー({target_cal} kcal)が基礎代謝({bmr} kcal)を下回っています。"
+                "減量幅を小さくすることを検討してください。"
+            )
 
         red_banner("今日のカロリー状況")
         target_diff = target_cal - total_ingested_cal
@@ -886,7 +933,7 @@ def main():
 
         st.divider()
 
-        now = datetime.date.today()
+        now = today_jst()
         today_str_display = now.strftime("%Y-%m-%d")
 
         # 表示する年月をsession_stateで管理（初期値は当月）
@@ -1222,7 +1269,8 @@ def main():
                     )
 
                     if uploaded_img is not None:
-                        image = Image.open(uploaded_img)
+                        image = ImageOps.exif_transpose(Image.open(uploaded_img))
+                        image.thumbnail((1024, 1024))
                         st.image(image, caption="解析対象", use_container_width=True)
 
                         if st.button("AIでカロリーを推定する", type="primary", use_container_width=True, key="btn_analyze_image"):
@@ -1630,6 +1678,9 @@ def main():
                 except Exception as e:
                     st.error(f"保存エラー: {e}")
 
+            # 以降は筋トレ用の入力欄。有酸素モードでは表示しない
+            return
+
         # --------------------------------------------------
         # 【パターンB】従来の筋トレ記録
         # --------------------------------------------------
@@ -1638,7 +1689,8 @@ def main():
             red_banner("① セッション全体の設定")
 
             # 今日の日付（デフォルト）を取得
-            work_date_default = st.session_state.get("target_date", datetime.date.today())
+            # 下の「日付」入力(key=w_date)の最新値を優先し、別日の設定を保存してしまうのを防ぐ
+            work_date_default = st.session_state.get("w_date") or st.session_state.get("target_date", today_jst())
             w_date_str_default = work_date_default.strftime("%Y-%m-%d")
 
             # 既存のセッション設定（実施時間・運動強度）を DB から取得
@@ -1693,7 +1745,9 @@ def main():
                         "date": w_date_str_default,
                         "duration_min": duration,
                         "intensity": intensity,
-                        "workout_burned_calories": estimated_burn,
+                        "workout_burned_calories": round(
+                            estimated_burn + get_cardio_burn_total(user_id, w_date_str_default), 1
+                        ),
                     }, on_conflict="user_id,date").execute()
                     invalidate_cache()
                     st.toast("セッション時間と消費カロリーを保存しました！")
@@ -1751,7 +1805,7 @@ def main():
 
         # 部位ごとの経過日数をすっきり表示
         with st.expander("各部位の前回実施からの経過日数", expanded=False):
-            today_obj = datetime.date.today()
+            today_obj = today_jst()
             
             # 2列（または3列）でコンパクトに並べる
             cols = st.columns(3)
@@ -1922,7 +1976,9 @@ def main():
                     supabase.table("daily_summaries").upsert({
                         "user_id": user_id,
                         "date": w_date_str,
-                        "workout_burned_calories": estimated_burn,
+                        "workout_burned_calories": round(
+                            estimated_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                        ),
                     }, on_conflict="user_id,date").execute()
                 except Exception:
                     pass
@@ -1938,54 +1994,70 @@ def main():
         st.divider()
         red_banner("本日の筋トレ記録")
         # --- 本日の筋トレ記録データ取得(セット保存または日付変更時のみ再取得) ---
-        # フラグが立っていたり、日付が変わっていれば再取得
         if "last_workout_date" not in st.session_state or st.session_state.last_workout_date != w_date_str or st.session_state.get("refresh_today_workout", False):
             w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
             st.session_state.workout_data_cache = w_res.data if w_res.data else []
             st.session_state.last_workout_date = w_date_str
             st.session_state.refresh_today_workout = False
-        
+
         workout_df = pd.DataFrame(st.session_state.workout_data_cache) if st.session_state.workout_data_cache else pd.DataFrame()
 
+        # 種目ごとの表示ループ
         if not workout_df.empty:
             for ex_name, group in workout_df.groupby("exercise", sort=False):
-                # 種目名と分析ボタンを横並びに配置
+                # 1. ヘッダー部（種目名 ＋ 分析ボタン）
                 col_title, col_btn = st.columns([5, 1])
                 with col_title:
-                    st.subheader(f"{ex_name}")
+                    st.markdown(
+                        f'''
+                        <div class="section-banner" style="margin: 0; display: flex; align-items: center;">
+                            <span>{ex_name}</span>
+                        </div>
+                        ''',
+                        unsafe_allow_html=True
+                    )
                 with col_btn:
                     if st.button("分析", key=f"analytics_{ex_name}", use_container_width=True):
                         show_exercise_analytics(user_id, ex_name, supabase)
 
-                # テーブルのヘッダー風表示
-                h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([1, 2, 2, 2, 2])
+                # 2. テーブルのヘッダー表示
+                h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([0.8, 2.5, 2.5, 2.0, 1.0])
                 h_col1.caption("**セット**")
                 h_col2.caption("**重さ (kg)**")
                 h_col3.caption("**回数**")
                 h_col4.caption("**推定RM**")
-                h_col5.caption("**操作**")
-
+                h_col5.caption("**削除**")
+                
+                # 3. 既存セット一覧のループ表示
                 for set_no, (_, row) in enumerate(group.iterrows(), start=1):
                     log_id = row["id"]
                     c1, c2, c3, c4, c5 = st.columns([0.8, 2.5, 2.5, 2.0, 1.0])
 
                     c1.write(f"**{set_no}**")
 
-                    # 入力フォーム（変更検知用に on_change や差分チェックを利用）
+                    # NULL値（None）の制御に対応した入力値の取得
+                    w_val = float(row["weight"]) if pd.notna(row["weight"]) else 0.0
+                    r_val = int(row["reps"]) if pd.notna(row["reps"]) else 0
+
                     new_weight = c2.number_input(
                         "重さ",
-                        value=float(row["weight"]),
+                        value=float(row["weight"]) if row["weight"] is not None else 0.0,
                         step=2.5,
                         format="%.1f",
                         key=f"w_{log_id}",
                         label_visibility="collapsed"
                     )
                     new_reps = c3.number_input(
-                        "回数", value=int(row["reps"]), min_value=0, step=1, key=f"r_{log_id}", label_visibility="collapsed"
+                        "回数", 
+                        value=int(row["reps"]) if row["reps"] is not None else 0, 
+                        min_value=0, 
+                        step=1, 
+                        key=f"r_{log_id}", 
+                        label_visibility="collapsed"
                     )
 
-                    # --- 【ここを追加】数値が変更されたら即座にデータベース上書き ---
-                    if new_weight != float(row["weight"]) or new_reps != int(row["reps"]):
+                    # 数値変更時の自動更新
+                    if new_weight != float(row["weight"] or 0) or new_reps != int(row["reps"] or 0):
                         supabase.table("workout_logs").update({
                             "weight": new_weight,
                             "reps": new_reps
@@ -1995,7 +2067,7 @@ def main():
                         st.toast("記録を更新しました！")
                         st.rerun()
 
-                    # RMのリアルタイム計算表示
+                    # RM計算
                     if new_reps > 0:
                         est_rm = new_weight * (1 + 0.025 * new_reps)
                         c4.write(f"{est_rm:.1f} kg")
@@ -2009,9 +2081,28 @@ def main():
                         st.session_state["refresh_today_workout"] = True
                         st.toast("セットを削除しました。")
                         st.rerun()
+                
+                # 4. セット追加ボタンの設置
+                st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)
+                if st.button(f"＋ セットを追加", key=f"add_set_{ex_name}"):
+                    # 追加時点の部位（part）を取得
+                    ex_part = group["part"].iloc[0] if "part" in group.columns and not group["part"].empty else "胸"
                     
+                    new_record = {
+                        "user_id": user_id,
+                        "date": w_date_str,  # 修正：selected_date から w_date_str へ変更
+                        "part": ex_part,
+                        "exercise": ex_name,
+                        "weight": 0.0,
+                        "reps": 0,
+                        "burned_calories": 0
+                    }
+                    supabase.table("workout_logs").insert(new_record).execute()
+                    invalidate_cache()
+                    st.session_state["refresh_today_workout"] = True
+                    st.rerun()
 
-                st.divider()
+                st.markdown("<hr style='margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;'>", unsafe_allow_html=True)
         else:
             st.info("本日の記録はまだありません。")
 
