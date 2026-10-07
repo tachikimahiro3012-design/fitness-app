@@ -325,7 +325,6 @@ def inject_theme_css():
         }
 
         div[data-testid="stColumn"] {
-            min-width: 0px !important; /* スマホ画面で崩れるのを防止 */
             padding: 0px 1px !important;
         }
 
@@ -1516,7 +1515,7 @@ def main():
         )
         ex_list = [r["name"] for r in ex_res.data] if ex_res.data else []
 
-        # 2. 該当部位の過去の最終実施日（MAX(date)）を取得
+        # 2. 該当部位の過去の最終実施日を取得（最新順に並べて、種目ごとに最初の1件だけ処理）
         last_dates = {}
         if ex_list:
             logs_res = (
@@ -1524,35 +1523,43 @@ def main():
                 .select("exercise, date")
                 .eq("user_id", user_id)
                 .eq("part", part)
+                .order("date", desc=True)  # 最新順に並べる
                 .execute()
             )
             if logs_res.data:
                 for row in logs_res.data:
                     ex_n = row["exercise"]
                     d_str = row["date"]
-                    # 最新の日付を保持
-                    if ex_n not in last_dates or d_str > last_dates[ex_n]:
+                    # 種目ごとに最初に出てきた(=最新の)日付だけを記録
+                    if ex_n not in last_dates:
                         last_dates[ex_n] = d_str
 
         # --------------------------------------------------
         # 部位ごとの「最終実施日・経過日数」一覧
         # --------------------------------------------------
-        # 各部位の最新実施日を DB から取得
+        # 各部位の最新実施日を DB から取得(キャッシュ化)
         all_parts = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
         
-        part_last_dates = {}
-        part_logs = (
-            supabase.table("workout_logs")
-            .select("part, date")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if part_logs.data:
-            for row in part_logs.data:
-                p_name = row["part"]
-                d_str = row["date"]
-                if p_name not in part_last_dates or d_str > part_last_dates[p_name]:
-                    part_last_dates[p_name] = d_str
+        @st.cache_data(ttl=60)  # 60秒キャッシュ(その間は同じデータを使い回す)
+        def get_part_last_dates(_user_id):
+            part_last_dates = {}
+            part_logs = (
+                supabase.table("workout_logs")
+                .select("part, date")
+                .eq("user_id", _user_id)
+                .order("date", desc=True)
+                .execute()
+            )
+            if part_logs.data:
+                for row in part_logs.data:
+                    p_name = row["part"]
+                    d_str = row["date"]
+                    # 部位ごとに最初に出てきた(=最新の)日付だけを記録
+                    if p_name not in part_last_dates:
+                        part_last_dates[p_name] = d_str
+            return part_last_dates
+        
+        part_last_dates = get_part_last_dates(user_id)
 
         # 部位ごとの経過日数をすっきり表示
         with st.expander("各部位の前回実施からの経過日数", expanded=False):
@@ -1684,6 +1691,32 @@ def main():
               st.session_state[f"confirm_del_step2_{exercise}"] = False
               st.rerun()
 
+        # --------------------------------------------------
+        # 前回記録(Last Record)を表示
+        # --------------------------------------------------
+        @st.cache_data(ttl=60)
+        def get_last_record(_user_id, _exercise):
+            """選択された種目の最新セット記録を取得"""
+            last_res = (
+                supabase.table("workout_logs")
+                .select("weight, reps, date")
+                .eq("user_id", _user_id)
+                .eq("exercise", _exercise)
+                .order("date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return last_res.data[0] if last_res.data else None
+        
+        if exercise != add_option_text:
+            last_record = get_last_record(user_id, exercise)
+            if last_record:
+                st.info(
+                    f"**前回記録**: {last_record['date']} に {last_record['weight']}kg × {last_record['reps']}回"
+                )
+            else:
+                st.info(f"**{exercise}**の記録はまだありません")
+        
         col1, col2 = st.columns(2)
         with col1:
             weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
@@ -1720,14 +1753,21 @@ def main():
                 st.success(
                     f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！"
                 )
-                st.rerun()
+                # st.rerun()の代わりに、本日の記録を再取得するフラグを立てる
+                st.session_state["refresh_today_workout"] = True
             else:
                 st.warning("種目が選択されていません。先に種目を選ぶか追加してください。")
         st.divider()
         red_banner("本日の筋トレ記録")
-        # --- 本日の筋トレ記録データ取得 ---
-        w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
-        workout_df = pd.DataFrame(w_res.data) if w_res.data else pd.DataFrame()
+        # --- 本日の筋トレ記録データ取得(セット保存または日付変更時のみ再取得) ---
+        # フラグが立っていたり、日付が変わっていれば再取得
+        if "last_workout_date" not in st.session_state or st.session_state.last_workout_date != w_date_str or st.session_state.get("refresh_today_workout", False):
+            w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
+            st.session_state.workout_data_cache = w_res.data if w_res.data else []
+            st.session_state.last_workout_date = w_date_str
+            st.session_state.refresh_today_workout = False
+        
+        workout_df = pd.DataFrame(st.session_state.workout_data_cache) if st.session_state.workout_data_cache else pd.DataFrame()
 
         if not workout_df.empty:
             for ex_name, group in workout_df.groupby("exercise", sort=False):
