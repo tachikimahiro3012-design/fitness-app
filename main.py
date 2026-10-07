@@ -9,6 +9,7 @@ import streamlit as st
 from google import genai
 from supabase import create_client, Client
 
+
 # --------------------------------------------------
 # ページ基本設定
 # --------------------------------------------------
@@ -33,11 +34,168 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
+
+@st.cache_resource
+def get_gemini_client(api_key: str):
+    return genai.Client(api_key=api_key)
+
+
+# --------------------------------------------------
+# データ取得(キャッシュ付き)
+#   書き込み(保存・削除)のたびに invalidate_cache() で破棄する
+# --------------------------------------------------
+CACHE_TTL = 600
+PART_LIST = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_profile(user_id):
+    res = supabase.table("user_profile").select("*").eq("user_id", user_id).execute()
+    return res.data[0] if res.data else None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_food_row(user_id, date_str):
+    res = (
+        supabase.table("food_logs")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("date", date_str)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_summary(user_id, date_str):
+    # テーブルが無い等の失敗はキャッシュされないよう、例外はそのまま投げる
+    res = (
+        supabase.table("daily_summaries")
+        .select("duration_min, intensity, workout_burned_calories")
+        .eq("user_id", user_id)
+        .eq("date", date_str)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_month_logs(user_id, month_start, month_end):
+    w_res = (
+        supabase.table("workout_logs")
+        .select("date")
+        .eq("user_id", user_id)
+        .gte("date", month_start)
+        .lt("date", month_end)
+        .execute()
+    )
+    recorded_dates = sorted({r["date"] for r in (w_res.data or [])})
+
+    f_res = (
+        supabase.table("food_logs")
+        .select("date, breakfast_cal, lunch_cal, dinner_cal, snack_cal")
+        .eq("user_id", user_id)
+        .gte("date", month_start)
+        .lt("date", month_end)
+        .execute()
+    )
+    food_cal_by_date = {}
+    for r in (f_res.data or []):
+        food_cal_by_date[r["date"]] = (
+            (r.get("breakfast_cal") or 0)
+            + (r.get("lunch_cal") or 0)
+            + (r.get("dinner_cal") or 0)
+            + (r.get("snack_cal") or 0)
+        )
+    return recorded_dates, food_cal_by_date
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_exercises(part):
+    res = supabase.table("exercises").select("name").eq("part", part).execute()
+    return [r["name"] for r in res.data] if res.data else []
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_part_last_dates(user_id):
+    # 全履歴を取得せず、部位ごとに最新1件だけ取得する
+    # (全履歴取得は Supabase の既定上限1000行で打ち切られるため、古い部位が「記録なし」になる問題もあった)
+    result = {}
+    for p in PART_LIST:
+        res = (
+            supabase.table("workout_logs")
+            .select("date")
+            .eq("user_id", user_id)
+            .eq("part", p)
+            .order("date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            result[p] = res.data[0]["date"]
+    return result
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_last_record(user_id, exercise):
+    res = (
+        supabase.table("workout_logs")
+        .select("weight, reps, date")
+        .eq("user_id", user_id)
+        .eq("exercise", exercise)
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_food_items(user_id, date_str):
+    res = (
+        supabase.table("food_items")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("date", date_str)
+        .order("created_at")
+        .execute()
+    )
+    return res.data if res.data else []
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_presets(user_id):
+    res = (
+        supabase.table("user_presets")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("id")
+        .execute()
+    )
+    return res.data if res.data else []
+
+
+def invalidate_cache():
+    for fn in (
+        fetch_profile, fetch_food_row, fetch_summary, fetch_month_logs,
+        fetch_exercises, fetch_part_last_dates, fetch_last_record,
+        fetch_food_items, fetch_presets,
+    ):
+        fn.clear()
+
 # CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
 st.markdown(
     """
     <style>
-    /* 1. 画面更新・ロード時の白曇り（グレーアウト/フェード）を完全に無効化 */
+    /* 1. 画面更新・ロード時の白曇り（Stale / 透過処理）を完全に無効化 */
+    [data-stale="true"],
+    [data-stale="true"] * {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+        pointer-events: auto !important;
+    }
+
     [data-testid="stAppViewContainer"],
     [data-testid="stMainBlockContainer"],
     [data-testid="stApp"] {
@@ -46,14 +204,9 @@ st.markdown(
         transition: none !important;
     }
 
-    /* 処理実行中にStreamlitが付与する透明度クラス・フェードアウトの上書き */
-    .st-emotion-cache-1wivap3,
-    div[class*="stApp"] {
-        opacity: 1 !important;
-    }
-
-    /* 右上の「Running...」ステータスウィジェットおよびアイコンを非表示 */
+    /* 右上の「Running...」ステータスウィジェットおよびオーバーレイ要素を完全に非表示 */
     [data-testid="stStatusWidget"],
+    [data-testid="stOverlay"],
     div[aria-live="polite"][role="status"] {
         visibility: hidden !important;
         display: none !important;
@@ -109,7 +262,7 @@ def init_default_exercises():
 # Gemini AIによる画像解析関数
 def analyze_food_image(image: Image.Image, api_key: str):
     try:
-        client = genai.Client(api_key=api_key)
+        client = get_gemini_client(api_key)
         prompt = """
         添付された食事の画像を解析し、おおよそのカロリー（kcal）と料理の名称・内訳を推定してください。
         回答は必ず以下の純粋なJSONフォーマットのみで出力してください（Markdownのバッククォートや装飾は不要です）。
@@ -141,7 +294,7 @@ def analyze_food_image(image: Image.Image, api_key: str):
 # Gemini AIによるテキスト解析関数
 def analyze_food_text(text_input: str, api_key: str):
   try:
-    client = genai.Client(api_key=api_key)
+    client = get_gemini_client(api_key)
     prompt = f"""
         以下の食事テキストから、合計カロリー（kcal）と整理された料理名を推定してください。
         テキスト: 「{text_input}」
@@ -503,8 +656,7 @@ def main():
     user_id = st.session_state.user.id
 
     # ユーザープロフィール取得
-    res = supabase.table("user_profile").select("*").eq("user_id", user_id).execute()
-    profile = res.data[0] if res.data else None
+    profile = fetch_profile(user_id)
 
     if profile:
         p_gender = profile.get("gender", "男性")
@@ -514,10 +666,9 @@ def main():
         p_act = profile.get("activity_level", "週3〜4回運動")
         p_steps = profile.get("steps", 5000)
         p_goal = profile.get("goal_phase", "標準増量 (+300 kcal)")
-        p_api_key = profile.get("api_key", "")
     else:
-        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal, p_api_key = (
-            "男性", 25, 170.0, 65.0, "週3〜4回運動", 8000, "標準増量 (+300 kcal)", ""
+        p_gender, p_age, p_height, p_weight, p_act, p_steps, p_goal = (
+            "男性", 25, 170.0, 65.0, "週3〜4回運動", 8000, "標準増量 (+300 kcal)"
         )
 
     # サイドバー：設定
@@ -525,22 +676,36 @@ def main():
     st.sidebar.caption(f"ログイン中: {st.session_state.user.email}")
     if st.sidebar.button("ログアウト"):
         supabase.auth.sign_out()
+        invalidate_cache()
         st.session_state.user = None
         st.rerun()
 
     st.sidebar.divider()
+
+    # --- APIキーの設定（ハイブリッド型：入力があれば優先、無ければsecretsを使用） ---
+    user_api_key = st.sidebar.text_input(
+        "Gemini API Key（任意）",
+        value="",
+        type="password",
+        help="空欄の場合はシステムの共通キーが使用されます。ご自身のキーを使用したい場合のみ入力してください。",
+    )
+
+    active_api_key = user_api_key.strip() if user_api_key.strip() else st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+
+    if not active_api_key:
+        st.sidebar.warning("APIキーが設定されていません。secrets.tomlに登録するかキーを入力してください。")
+
+    st.sidebar.divider()
+
+    # --- プロフィール設定フォーム ---
     with st.sidebar.form("profile_form"):
-        api_key_input = st.text_input(
-            "Gemini API Key",
-            value=p_api_key if p_api_key else "",
-            type="password",
-            help="Google AI Studioで取得したAPIキーを入力してください",
-        )
         gender = st.selectbox("性別", ["男性", "女性"], index=0 if p_gender == "男性" else 1)
         age = st.number_input("年齢", min_value=10, max_value=100, value=int(p_age))
+        
         # 身長入力（0.5cm刻み）
-        height = st.number_input("身長 (cm)",min_value=50.0,max_value=250.0,value=float(p_height),step=0.5,format="%.1f",)
-        weight = st.number_input("体重 (kg)",min_value=20.0,max_value=300.0,value=float(p_weight),step=0.5,format="%.1f",)
+        height = st.number_input("身長 (cm)", min_value=50.0, max_value=250.0, value=float(p_height), step=0.5, format="%.1f")
+        weight = st.number_input("体重 (kg)", min_value=20.0, max_value=300.0, value=float(p_weight), step=0.5, format="%.1f")
+        
         act_options = ["デスクワーク中心", "週1〜2回運動", "週3〜4回運動", "週5回以上運動"]
         act_index = act_options.index(p_act) if p_act in act_options else 2
         act_level = st.selectbox("日常活動レベル", act_options, index=act_index)
@@ -568,12 +733,11 @@ def main():
                 "activity_level": act_level,
                 "steps": steps,
                 "goal_phase": goal_phase,
-                "api_key": api_key_input.strip(),
             }
             supabase.table("user_profile").upsert(profile_data, on_conflict="user_id").execute()
+            invalidate_cache()
             st.sidebar.success("設定を更新しました。")
             st.rerun()
-
 
     # 計算実行
     # 以前は引数の並び順が関数定義とズレていて(活動レベルの文字列が
@@ -596,8 +760,7 @@ def main():
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
     # 今日の食事記録を取得
-    food_res = supabase.table("food_logs").select("*").eq("user_id", user_id).eq("date", today_str).execute()
-    food_row = food_res.data[0] if food_res.data else None
+    food_row = fetch_food_row(user_id, today_str)
     total_ingested_cal = (
         (food_row.get("breakfast_cal", 0) or 0) +
         (food_row.get("lunch_cal", 0) or 0) +
@@ -609,17 +772,9 @@ def main():
     # workout_logs.burned_calories は保存時に常に0で入るようになったため、
     # セット保存のたびにUPSERTされる daily_summaries.workout_burned_calories を使う
     try:
-        summary_res = (
-            supabase.table("daily_summaries")
-            .select("workout_burned_calories")
-            .eq("user_id", user_id)
-            .eq("date", today_str)
-            .execute()
-        )
+        summary_row = fetch_summary(user_id, today_str)
         total_workout_burn = (
-            (summary_res.data[0].get("workout_burned_calories", 0) or 0)
-            if summary_res.data
-            else 0.0
+            (summary_row.get("workout_burned_calories", 0) or 0) if summary_row else 0.0
         )
     except Exception:
         # daily_summaries テーブルがまだ無い場合などのフォールバック
@@ -772,16 +927,9 @@ def main():
         next_y = cal_y if cal_m < 12 else cal_y + 1
         month_end = f"{next_y}-{next_m:02d}-01"
 
-        # 当月の筋トレログと食事ログを取得
-        w_month_res = supabase.table("workout_logs").select("date").eq("user_id", user_id).gte("date", month_start).lt("date", month_end).execute()
-        recorded_dates = set([r["date"] for r in w_month_res.data]) if w_month_res.data else set()
-
-        f_month_res = supabase.table("food_logs").select("date, breakfast_cal, lunch_cal, dinner_cal, snack_cal").eq("user_id", user_id).gte("date", month_start).lt("date", month_end).execute()
-        food_cal_by_date = {}
-        if f_month_res.data:
-            for r in f_month_res.data:
-                tot = (r.get("breakfast_cal") or 0) + (r.get("lunch_cal") or 0) + (r.get("dinner_cal") or 0) + (r.get("snack_cal") or 0)
-                food_cal_by_date[r["date"]] = tot
+        # 当月の筋トレログと食事ログを取得(キャッシュ)
+        recorded_dates_list, food_cal_by_date = fetch_month_logs(user_id, month_start, month_end)
+        recorded_dates = set(recorded_dates_list)
 
         # --------------------------------------------------
         # カレンダー用CSS（iOS風：日曜始まり／今日は赤丸／筋トレ日は青い点）
@@ -1000,14 +1148,7 @@ def main():
         f_date_str = food_date.strftime("%Y-%m-%d")
 
         # 該当日の既存ログを取得
-        f_res = (
-            supabase.table("food_logs")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("date", f_date_str)
-            .execute()
-        )
-        f_row = f_res.data[0] if f_res.data else {}
+        f_row = fetch_food_row(user_id, f_date_str) or {}
 
         current_b = float(f_row.get("breakfast_cal", 0.0) or 0.0)
         current_l = float(f_row.get("lunch_cal", 0.0) or 0.0)
@@ -1027,6 +1168,7 @@ def main():
             supabase.table("food_logs").upsert(
                 food_data, on_conflict="user_id,date"
             ).execute()
+            invalidate_cache()
 
         # 明細を追加して合計も更新するヘルパー
         def add_food_item(meal_type, dish_name, calories, source):
@@ -1057,11 +1199,11 @@ def main():
             ["AI解析", "手入力・微調整", "定番・ショートカット"]
         )
 
-                # =============================================
+        # =============================================
         # タブ1: AI解析（写真 + 文章）
         # =============================================
         with food_tab1:
-            if not p_api_key:
+            if not active_api_key:
                 st.warning("左側のサイドバー（ユーザー設定）に Gemini API キーを入力してください。")
             else:
                 analysis_mode = st.radio(
@@ -1085,7 +1227,7 @@ def main():
 
                         if st.button("AIでカロリーを推定する", type="primary", use_container_width=True, key="btn_analyze_image"):
                             with st.spinner("AIが料理とカロリーを解析中..."):
-                                result, error = analyze_food_image(image, p_api_key)
+                                result, error = analyze_food_image(image, active_api_key)
                                 if error:
                                     st.error(f"解析エラー: {error}")
                                 else:
@@ -1122,6 +1264,7 @@ def main():
                                 "name": dish_name,
                                 "calories": added_cal,
                             }).execute()
+                            invalidate_cache()
                             st.toast(f"「{dish_name}」を定番メニューに保存しました！")
 
                 # ---------- 文章で解析 ----------
@@ -1138,7 +1281,7 @@ def main():
                             st.warning("文章を入力してください。")
                         else:
                             with st.spinner("AIがカロリーを推定中..."):
-                                result, error = analyze_food_text(text_input.strip(), p_api_key)
+                                result, error = analyze_food_text(text_input.strip(), active_api_key)
                                 if error:
                                     st.error(f"解析エラー: {error}")
                                 else:
@@ -1166,13 +1309,15 @@ def main():
                                     st.success(f"【{mt}】「{dish_name}」（{int(added_cal)} kcal）を追加しました！")
                                     st.rerun()
 
-                        if st.button("★ 定番メニューに保存", key="save_text_preset", use_container_width=True):
+                        if st.button("定番メニューに保存", key="save_text_preset", use_container_width=True):
                             supabase.table("user_presets").insert({
                                 "user_id": user_id,
                                 "name": dish_name,
                                 "calories": added_cal,
                             }).execute()
+                            invalidate_cache()
                             st.toast(f"「{dish_name}」を定番メニューに保存しました！")
+
         # =============================================
         # タブ2: 手入力・微調整
         # =============================================
@@ -1235,14 +1380,7 @@ def main():
         with food_tab3:
             st.caption("よく食べるメニューをワンタップで追加したり、自分の定番メニューを登録・管理できます。")
 
-            preset_res = (
-                supabase.table("user_presets")
-                .select("*")
-                .eq("user_id", user_id)
-                .order("id")
-                .execute()
-            )
-            custom_presets = preset_res.data if preset_res.data else []
+            custom_presets = fetch_presets(user_id)
 
             p_cat = st.selectbox("追加先", ["朝食", "昼食", "夕食", "間食"], key="preset_cat")
 
@@ -1263,6 +1401,7 @@ def main():
                         with col_del:
                             if st.button("×", key=f"del_preset_{p_id}", help="このプリセットを削除"):
                                 supabase.table("user_presets").delete().eq("id", p_id).execute()
+                                invalidate_cache()
                                 st.toast("定番メニューを削除しました。")
                                 st.rerun()
             else:
@@ -1283,6 +1422,7 @@ def main():
                                 "name": new_p_name.strip(),
                                 "calories": new_p_cal
                             }).execute()
+                            invalidate_cache()
                             st.toast(f"「{new_p_name.strip()}」を定番メニューに登録しました！")
                             st.rerun()
                         else:
@@ -1380,15 +1520,7 @@ def main():
         # =============================================
         st.markdown("#### 本日の明細履歴")
 
-        items_res = (
-            supabase.table("food_items")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("date", f_date_str)
-            .order("created_at")
-            .execute()
-        )
-        items = items_res.data if items_res.data else []
+        items = fetch_food_items(user_id, f_date_str)
 
         if items:
             for item in items:
@@ -1421,6 +1553,7 @@ def main():
             if st.button("全区分の食事記録をクリアする", type="secondary"):
                 supabase.table("food_logs").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
                 supabase.table("food_items").delete().eq("user_id", user_id).eq("date", f_date_str).execute()
+                invalidate_cache()
                 st.toast("本日の食事記録をすべてクリアしました。")
                 st.rerun()
 
@@ -1491,6 +1624,7 @@ def main():
                         "burned_calories": cardio_burn
                     }).execute()
 
+                    invalidate_cache()
                     st.toast(f"トレッドミル ({cardio_dur}分, 約{cardio_burn}kcal) を記録しました！")
                     st.rerun()
                 except Exception as e:
@@ -1508,13 +1642,10 @@ def main():
             w_date_str_default = work_date_default.strftime("%Y-%m-%d")
 
             # 既存のセッション設定（実施時間・運動強度）を DB から取得
-            existing_summary = (
-                supabase.table("daily_summaries")
-                .select("duration_min, intensity")
-                .eq("user_id", user_id)
-                .eq("date", w_date_str_default)
-                .execute()
-            )
+            try:
+                existing_row = fetch_summary(user_id, w_date_str_default)
+            except Exception:
+                existing_row = None
             saved_duration = None
             saved_intensity_idx = 0
             intensity_options = [
@@ -1523,12 +1654,12 @@ def main():
                 "高強度 (サーキット/高密度/スーパーセット)",
             ]
 
-            if existing_summary.data:
-                dur_val = existing_summary.data[0].get("duration_min")
+            if existing_row:
+                dur_val = existing_row.get("duration_min")
                 if dur_val is not None:
                     saved_duration = int(dur_val)
                 
-                intent_val = existing_summary.data[0].get("intensity")
+                intent_val = existing_row.get("intensity")
                 if intent_val in intensity_options:
                     saved_intensity_idx = intensity_options.index(intent_val)
 
@@ -1564,6 +1695,7 @@ def main():
                         "intensity": intensity,
                         "workout_burned_calories": estimated_burn,
                     }, on_conflict="user_id,date").execute()
+                    invalidate_cache()
                     st.toast("セッション時間と消費カロリーを保存しました！")
                     st.rerun()
                 except Exception as e:
@@ -1591,6 +1723,7 @@ def main():
             supabase.table("user_profile").upsert(
                 {"user_id": user_id, "last_part": new_p}, on_conflict="user_id"
             ).execute()
+            fetch_profile.clear()
 
         with col_part:
             part = st.selectbox(
@@ -1605,32 +1738,8 @@ def main():
         # 【追加】選択部位の種目別「最終実施日・経過日数」一覧
         # --------------------------------------------------
         # 1. 選択された部位の種目一覧を取得
-        ex_res = (
-            supabase.table("exercises")
-            .select("name")
-            .eq("part", part)
-            .execute()
-        )
-        ex_list = [r["name"] for r in ex_res.data] if ex_res.data else []
+        ex_list = fetch_exercises(part)
 
-        # 2. 該当部位の過去の最終実施日を取得（最新順に並べて、種目ごとに最初の1件だけ処理）
-        last_dates = {}
-        if ex_list:
-            logs_res = (
-                supabase.table("workout_logs")
-                .select("exercise, date")
-                .eq("user_id", user_id)
-                .eq("part", part)
-                .order("date", desc=True)  # 最新順に並べる
-                .execute()
-            )
-            if logs_res.data:
-                for row in logs_res.data:
-                    ex_n = row["exercise"]
-                    d_str = row["date"]
-                    # 種目ごとに最初に出てきた(=最新の)日付だけを記録
-                    if ex_n not in last_dates:
-                        last_dates[ex_n] = d_str
 
         # --------------------------------------------------
         # 部位ごとの「最終実施日・経過日数」一覧
@@ -1638,26 +1747,7 @@ def main():
         # 各部位の最新実施日を DB から取得(キャッシュ化)
         all_parts = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
         
-        @st.cache_data(ttl=60)  # 60秒キャッシュ(その間は同じデータを使い回す)
-        def get_part_last_dates(_user_id):
-            part_last_dates = {}
-            part_logs = (
-                supabase.table("workout_logs")
-                .select("part, date")
-                .eq("user_id", _user_id)
-                .order("date", desc=True)
-                .execute()
-            )
-            if part_logs.data:
-                for row in part_logs.data:
-                    p_name = row["part"]
-                    d_str = row["date"]
-                    # 部位ごとに最初に出てきた(=最新の)日付だけを記録
-                    if p_name not in part_last_dates:
-                        part_last_dates[p_name] = d_str
-            return part_last_dates
-        
-        part_last_dates = get_part_last_dates(user_id)
+        part_last_dates = fetch_part_last_dates(user_id)
 
         # 部位ごとの経過日数をすっきり表示
         with st.expander("各部位の前回実施からの経過日数", expanded=False):
@@ -1695,6 +1785,7 @@ def main():
                 supabase.table("user_profile").upsert(
                     {"user_id": user_id, "last_exercise": new_ex}, on_conflict="user_id"
                 ).execute()
+                fetch_profile.clear()
 
         col_select, col_del = st.columns([5, 1])
         with col_select:
@@ -1727,6 +1818,7 @@ def main():
                 supabase.table("exercises").insert(
                     {"part": part, "name": new_ex_name.strip()}
                 ).execute()
+                invalidate_cache()
                 st.success(f"「{new_ex_name.strip()}」を登録しました！")
                 st.rerun()
               except Exception:
@@ -1776,6 +1868,7 @@ def main():
                 supabase.table("exercises").delete().eq(
                     "name", exercise
                 ).eq("part", part).execute()
+                invalidate_cache()
 
                 st.session_state[f"confirm_del_step2_{exercise}"] = False
                 st.success(
@@ -1792,22 +1885,9 @@ def main():
         # --------------------------------------------------
         # 前回記録(Last Record)を表示
         # --------------------------------------------------
-        @st.cache_data(ttl=60)
-        def get_last_record(_user_id, _exercise):
-            """選択された種目の最新セット記録を取得"""
-            last_res = (
-                supabase.table("workout_logs")
-                .select("weight, reps, date")
-                .eq("user_id", _user_id)
-                .eq("exercise", _exercise)
-                .order("date", desc=True)
-                .limit(1)
-                .execute()
-            )
-            return last_res.data[0] if last_res.data else None
         
         if exercise != add_option_text:
-            last_record = get_last_record(user_id, exercise)
+            last_record = fetch_last_record(user_id, exercise)
             if last_record:
                 st.info(
                     f"**前回記録**: {last_record['date']} に {last_record['weight']}kg × {last_record['reps']}回"
@@ -1848,8 +1928,7 @@ def main():
                     pass
 
                 # キャッシュを最新化し、画面を即時更新
-                get_last_record.clear()
-                get_part_last_dates.clear()
+                invalidate_cache()
                 st.session_state["refresh_today_workout"] = True
                 st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
                 st.rerun()
@@ -1912,6 +1991,7 @@ def main():
                             "reps": new_reps
                         }).eq("id", log_id).execute()
                         st.session_state["refresh_today_workout"] = True
+                        invalidate_cache()
                         st.toast("記録を更新しました！")
                         st.rerun()
 
@@ -1925,8 +2005,7 @@ def main():
                     # 削除ボタン
                     if c5.button("×", key=f"del_{log_id}", help="このセットを削除"):
                         supabase.table("workout_logs").delete().eq("id", log_id).execute()
-                        get_last_record.clear()
-                        get_part_last_dates.clear()
+                        invalidate_cache()
                         st.session_state["refresh_today_workout"] = True
                         st.toast("セットを削除しました。")
                         st.rerun()
