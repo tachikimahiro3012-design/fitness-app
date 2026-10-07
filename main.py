@@ -9,49 +9,6 @@ import streamlit as st
 from google import genai
 from supabase import create_client, Client
 
-
-# CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
-st.markdown(
-    """
-    <style>
-    /* 1. 画面遷移・ロード時の白く曇るオーバーレイとくるくるアニメーションを非表示 */
-    div[data-testid="stStatusWidget"] {
-        visibility: hidden;
-        display: none;
-    }
-    div[data-testid="stApp"] > div:first-child {
-        opacity: 1 !important;
-    }
-    .stApp > header {
-        background-color: transparent;
-    }
-    /* ロード中の薄暗いオーバーレイ要素を無効化 */
-    div[class*="st-"] {
-        transition: none !important;
-    }
-    div[data-aria-clear="true"] {
-        opacity: 1 !important;
-    }
-
-    /* 2. 画面幅が狭い端末（スマホ）でもカラムの横並びを維持する */
-    [data-testid="stHorizontalBlock"] {
-        flex-direction: row !important;
-        flex-wrap: nowrap !important;
-        overflow-x: auto;
-    }
-    
-    [data-testid="stColumn"] {
-        min-width: 42px !important;
-    }
-
-    div[data-testid="stNumberInput"] {
-        min-width: 60px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 # --------------------------------------------------
 # ページ基本設定
 # --------------------------------------------------
@@ -75,6 +32,56 @@ def init_supabase() -> Client:
     return create_client(url, key)
 
 supabase = init_supabase()
+
+# CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
+st.markdown(
+    """
+    <style>
+    /* 1. 画面更新・ロード時の白曇り（グレーアウト/フェード）を完全に無効化 */
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMainBlockContainer"],
+    [data-testid="stApp"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+    }
+
+    /* 処理実行中にStreamlitが付与する透明度クラス・フェードアウトの上書き */
+    .st-emotion-cache-1wivap3,
+    div[class*="stApp"] {
+        opacity: 1 !important;
+    }
+
+    /* 右上の「Running...」ステータスウィジェットおよびアイコンを非表示 */
+    [data-testid="stStatusWidget"],
+    div[aria-live="polite"][role="status"] {
+        visibility: hidden !important;
+        display: none !important;
+    }
+
+    /* ヘッダー背景の透明化 */
+    .stApp > header {
+        background-color: transparent !important;
+    }
+
+    /* 2. スマホ端末でもカラム（Column）の横並びを強制的に維持 */
+    [data-testid="stHorizontalBlock"] {
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        overflow-x: auto !important;
+    }
+
+    [data-testid="stColumn"] {
+        min-width: 42px !important;
+    }
+
+    div[data-testid="stNumberInput"] {
+        min-width: 60px !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # デフォルト種目の初期登録処理
 def init_default_exercises():
