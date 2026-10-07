@@ -341,6 +341,33 @@ def inject_theme_css():
         """,
         unsafe_allow_html=True,
     )
+def calculate_cardio_burn(weight_kg, speed_kmh, incline_percent, duration_min):
+    if weight_kg is None or speed_kmh is None or incline_percent is None or duration_min is None:
+        return 0.0
+    
+    if duration_min <= 0 or speed_kmh <= 0 or weight_kg <= 0:
+        return 0.0
+
+    # 時速(km/h)を分速(m/min)に変換
+    speed_m_min = (speed_kmh * 1000) / 60.0
+    grade = incline_percent / 100.0
+
+    # ACSM公式によるVO2算出 (mL/kg/min)
+    if speed_kmh <= 8.0:
+        # ウォーキング公式
+        vo2 = (0.1 * speed_m_min) + (1.8 * speed_m_min * grade) + 3.5
+    else:
+        # ランニング公式
+        vo2 = (0.2 * speed_m_min) + (0.9 * speed_m_min * grade) + 3.5
+
+    # 安静時(3.5 mL/kg/min)を除いた運動による純酸素消費量
+    net_vo2 = max(0.0, vo2 - 3.5)
+
+    # 1Lの酸素消費 ≒ 約 5 kcal
+    # (mL/kg/min * kg / 1000) * 5 kcal * 分
+    burned_kcal = (net_vo2 * weight_kg / 1000.0) * 5.0 * duration_min
+
+    return round(burned_kcal, 1)
 
 # --------------------------------------------------
 # 種目別パフォーマンス分析ダイアログ
@@ -1402,74 +1429,145 @@ def main():
     # --------------------------------------------------
     elif st.session_state.view == "workout":
         red_banner("筋トレログ & 消費カロリー推定")
-
-        red_banner("① セッション全体の設定")
-
-        # 今日の日付（デフォルト）を取得
-        work_date_default = st.session_state.get("target_date", datetime.date.today())
-        w_date_str_default = work_date_default.strftime("%Y-%m-%d")
-
-        # 既存のセッション設定（実施時間・運動強度）を DB から取得
-        existing_summary = (
-            supabase.table("daily_summaries")
-            .select("duration_min, intensity")
-            .eq("user_id", user_id)
-            .eq("date", w_date_str_default)
-            .execute()
+        # 筋トレ / 有酸素 の切り替えセクション
+        workout_type = st.radio(
+            "運動の種類を選択",
+            ["筋トレ", "有酸素運動"],
+            horizontal=True,
+            key="workout_type_selector"
         )
-        saved_duration = None
-        saved_intensity_idx = 0
-        intensity_options = [
-            "標準 (通常のウェイトトレーニング)",
-            "軽度 (ストレッチ/自重/休憩長め)",
-            "高強度 (サーキット/高密度/スーパーセット)",
-        ]
+        # --------------------------------------------------
+        # 【パターンA】有酸素運動の記録
+        # --------------------------------------------------
+        if workout_type == "有酸素運動":
+            red_banner("有酸素運動 記録")
 
-        if existing_summary.data:
-            dur_val = existing_summary.data[0].get("duration_min")
-            if dur_val is not None:
-                saved_duration = int(dur_val)
-            
-            intent_val = existing_summary.data[0].get("intensity")
-            if intent_val in intensity_options:
-                saved_intensity_idx = intensity_options.index(intent_val)
+            c_date, c_dummy = st.columns(2)
+            with c_date:
+                cardio_date = st.date_input("日付", value=st.session_state.target_date, key="cardio_date")
+                st.session_state.target_date = cardio_date
+                c_date_str = cardio_date.strftime("%Y-%m-%d")
 
-        col_dur, col_int = st.columns(2)
-        with col_dur:
-            duration_input = st.number_input(
-                "全体実施時間 (分)",
-                min_value=0,
-                step=5,
-                value=saved_duration,
-                placeholder="0",
-                key="session_duration_input"
+            col_s, col_inc, col_dur = st.columns(3)
+            with col_s:
+                speed = st.number_input("時速 (km/h)", min_value=1.0, max_value=25.0, value=None, step=0.5)
+            with col_inc:
+                incline = st.number_input("傾斜 (%)", min_value=0.0, max_value=20.0, value=None, step=0.5)
+            with col_dur:
+                cardio_dur = st.number_input("時間 (分)", min_value=1, max_value=300, value=None, step=5)
+
+
+            # 入力がすべて揃っている場合のみ計算、未入力時は 0.0
+            if speed is not None and incline is not None and cardio_dur is not None:
+                cardio_burn = calculate_cardio_burn(p_weight, speed, incline, cardio_dur)
+            else:
+                cardio_burn = 0.0
+            st.info(f"推定純消費カロリー (ACSM公式): **約 {cardio_burn} kcal**")
+
+            if st.button("有酸素運動を記録", type="primary", use_container_width=True):
+                # daily_summaries または workout_logs へ消費カロリーを加算保存
+                # （既存の daily_summaries テーブルに加算、あるいは workout_logs に種目名="トレッドミル" で登録）
+                try:
+                    # 既存の消費カロリーを取得して加算
+                    summary_res = supabase.table("daily_summaries").select("workout_burned_calories").eq("user_id", user_id).eq("date", c_date_str).execute()
+                    current_burn = summary_res.data[0].get("workout_burned_calories", 0.0) if summary_res.data else 0.0
+
+                    new_total_burn = current_burn + cardio_burn
+
+                    supabase.table("daily_summaries").upsert({
+                        "user_id": user_id,
+                        "date": c_date_str,
+                        "workout_burned_calories": new_total_burn
+                    }, on_conflict="user_id,date").execute()
+
+                    # ログ明細としても保存する場合
+                    supabase.table("workout_logs").insert({
+                        "user_id": user_id,
+                        "date": c_date_str,
+                        "part": "有酸素",
+                        "exercise": f"トレッドミル ({speed}km/h, 傾斜{incline}%)",
+                        "weight": incline,       # 傾斜を保持
+                        "reps": cardio_dur,       # 実施時間を保持
+                        "burned_calories": cardio_burn
+                    }).execute()
+
+                    st.toast(f"トレッドミル ({cardio_dur}分, 約{cardio_burn}kcal) を記録しました！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存エラー: {e}")
+
+        # --------------------------------------------------
+        # 【パターンB】従来の筋トレ記録
+        # --------------------------------------------------
+        else:
+
+            red_banner("① セッション全体の設定")
+
+            # 今日の日付（デフォルト）を取得
+            work_date_default = st.session_state.get("target_date", datetime.date.today())
+            w_date_str_default = work_date_default.strftime("%Y-%m-%d")
+
+            # 既存のセッション設定（実施時間・運動強度）を DB から取得
+            existing_summary = (
+                supabase.table("daily_summaries")
+                .select("duration_min, intensity")
+                .eq("user_id", user_id)
+                .eq("date", w_date_str_default)
+                .execute()
             )
-            duration = duration_input or 0
-        with col_int:
-            intensity = st.selectbox(
-                "運動強度",
-                intensity_options,
-                index=saved_intensity_idx,
-                key="session_intensity_select"
-            )
+            saved_duration = None
+            saved_intensity_idx = 0
+            intensity_options = [
+                "標準 (通常のウェイトトレーニング)",
+                "軽度 (ストレッチ/自重/休憩長め)",
+                "高強度 (サーキット/高密度/スーパーセット)",
+            ]
 
-        estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
-        st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+            if existing_summary.data:
+                dur_val = existing_summary.data[0].get("duration_min")
+                if dur_val is not None:
+                    saved_duration = int(dur_val)
+                
+                intent_val = existing_summary.data[0].get("intensity")
+                if intent_val in intensity_options:
+                    saved_intensity_idx = intensity_options.index(intent_val)
 
-        # 【追加】セッション設定の保存ボタン
-        if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
-            try:
-                supabase.table("daily_summaries").upsert({
-                    "user_id": user_id,
-                    "date": w_date_str_default,
-                    "duration_min": duration,
-                    "intensity": intensity,
-                    "workout_burned_calories": estimated_burn,
-                }, on_conflict="user_id,date").execute()
-                st.toast("セッション時間と消費カロリーを保存しました！")
-                st.rerun()
-            except Exception as e:
-                st.error(f"保存時にエラーが発生しました: {e}")
+            col_dur, col_int = st.columns(2)
+            with col_dur:
+                duration_input = st.number_input(
+                    "全体実施時間 (分)",
+                    min_value=0,
+                    step=5,
+                    value=saved_duration,
+                    placeholder="0",
+                    key="session_duration_input"
+                )
+                duration = duration_input or 0
+            with col_int:
+                intensity = st.selectbox(
+                    "運動強度",
+                    intensity_options,
+                    index=saved_intensity_idx,
+                    key="session_intensity_select"
+                )
+
+            estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
+            st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+
+            # 【追加】セッション設定の保存ボタン
+            if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
+                try:
+                    supabase.table("daily_summaries").upsert({
+                        "user_id": user_id,
+                        "date": w_date_str_default,
+                        "duration_min": duration,
+                        "intensity": intensity,
+                        "workout_burned_calories": estimated_burn,
+                    }, on_conflict="user_id,date").execute()
+                    st.toast("セッション時間と消費カロリーを保存しました！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存時にエラーが発生しました: {e}")
 
         st.divider()
         red_banner("② 種目の記録")
@@ -1717,12 +1815,12 @@ def main():
             else:
                 st.info(f"**{exercise}**の記録はまだありません")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
-        with col2:
-            reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=None, placeholder="0") or 0
-        
+            col1, col2 = st.columns(2)
+            with col1:
+                weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
+            with col2:
+                reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=None, placeholder="0") or 0
+            
         if st.button("筋トレ記録を保存", type="primary"):
             if exercise != add_option_text:
                 # 1. 各セットの記録（burned_calories は 0 で保存）
@@ -1735,28 +1833,29 @@ def main():
                     "reps": reps_val,
                     "duration_min": duration,
                     "intensity": intensity,
-                    "burned_calories": 0,  # ← 0 に変更して重複加算を防ぐ
+                    "burned_calories": 0,
                 }
                 supabase.table("workout_logs").insert(workout_data).execute()
 
-                # 2. その日の全体消費カロリーを daily_summaries（日別管理テーブル）に UPSERT 保存
+                # 2. その日の全体消費カロリーを daily_summaries に UPSERT
                 try:
                     supabase.table("daily_summaries").upsert({
                         "user_id": user_id,
                         "date": w_date_str,
-                        "workout_burned_calories": estimated_burn,  # その日の総消費カロリー（上書き保存）
+                        "workout_burned_calories": estimated_burn,
                     }, on_conflict="user_id,date").execute()
                 except Exception:
-                    # まだ daily_summaries テーブルが無い場合などのフォールバック処理
                     pass
 
-                st.success(
-                    f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！"
-                )
-                # st.rerun()の代わりに、本日の記録を再取得するフラグを立てる
+                # キャッシュを最新化し、画面を即時更新
+                get_last_record.clear()
+                get_part_last_dates.clear()
                 st.session_state["refresh_today_workout"] = True
+                st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
+                st.rerun()
             else:
                 st.warning("種目が選択されていません。先に種目を選ぶか追加してください。")
+
         st.divider()
         red_banner("本日の筋トレ記録")
         # --- 本日の筋トレ記録データ取得(セット保存または日付変更時のみ再取得) ---
@@ -1812,7 +1911,9 @@ def main():
                             "weight": new_weight,
                             "reps": new_reps
                         }).eq("id", log_id).execute()
+                        st.session_state["refresh_today_workout"] = True
                         st.toast("記録を更新しました！")
+                        st.rerun()
 
                     # RMのリアルタイム計算表示
                     if new_reps > 0:
@@ -1824,8 +1925,12 @@ def main():
                     # 削除ボタン
                     if c5.button("×", key=f"del_{log_id}", help="このセットを削除"):
                         supabase.table("workout_logs").delete().eq("id", log_id).execute()
+                        get_last_record.clear()
+                        get_part_last_dates.clear()
+                        st.session_state["refresh_today_workout"] = True
                         st.toast("セットを削除しました。")
-                        st.rerun() 
+                        st.rerun()
+                    
 
                 st.divider()
         else:
