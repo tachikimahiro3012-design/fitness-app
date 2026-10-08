@@ -2,6 +2,7 @@ import calendar
 import datetime
 import json
 import os
+import time
 import pandas as pd
 import plotly.express as px
 from PIL import Image, ImageOps
@@ -15,6 +16,43 @@ JST = datetime.timezone(datetime.timedelta(hours=9))
 
 def today_jst() -> datetime.date:
     return datetime.datetime.now(JST).date()
+
+
+# --------------------------------------------------
+# 画面と日付をURLに残す
+#   接続が切れて新しいセッションになっても、同じ画面・日付に戻れるようにする。
+#   古いURL(6時間より前)や不正な値は無視して、ホーム・今日から始める。
+# --------------------------------------------------
+NAV_VIEWS = ("dashboard", "food", "workout")
+NAV_RESTORE_SECONDS = 6 * 60 * 60
+
+
+def save_nav_state():
+    try:
+        view = st.session_state.view
+        date_iso = st.session_state.target_date.isoformat()
+        qp = st.query_params
+        # 画面か日付が変わったときだけ書き込む(再実行のたびにURLを書き換えない)
+        if qp.get("view") != view or qp.get("date") != date_iso:
+            qp["view"] = view
+            qp["date"] = date_iso
+            qp["t"] = str(int(time.time()))
+    except Exception:
+        pass
+
+
+def restore_nav_state():
+    view, target = "dashboard", today_jst()
+    try:
+        qp = st.query_params
+        if time.time() - int(qp.get("t", "0")) <= NAV_RESTORE_SECONDS:
+            if qp.get("view") in NAV_VIEWS:
+                view = qp["view"]
+            if qp.get("date"):
+                target = datetime.date.fromisoformat(qp["date"])
+    except Exception:
+        pass
+    return view, target
 
 
 # --------------------------------------------------
@@ -151,10 +189,13 @@ def fetch_last_record(user_id, exercise):
         .eq("user_id", user_id)
         .eq("exercise", exercise)
         .order("date", desc=True)
-        .limit(1)
+        .limit(20)
         .execute()
     )
-    return res.data[0] if res.data else None
+    for r in (res.data or []):
+        if r.get("weight") is not None and r.get("reps") is not None:
+            return r
+    return None
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -593,7 +634,11 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
     st.info("この種目の過去データがまだありません。")
     return
 
-  # 0kg・0回のデータを除外
+  # NULL(空欄)が混ざっても比較できるよう数値に変換(変換できないものはNaN)
+  df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
+  df["reps"] = pd.to_numeric(df["reps"], errors="coerce")
+
+  # 0kg・0回・空欄のデータを除外
   df = df[(df["weight"] > 0) & (df["reps"] > 0)].copy()
 
   if df.empty:
@@ -832,8 +877,10 @@ def main():
         unsafe_allow_html=True,
     )
 
-    if "view" not in st.session_state:
-        st.session_state.view = "dashboard"
+    if "view" not in st.session_state or "target_date" not in st.session_state:
+        _restored_view, _restored_date = restore_nav_state()
+        st.session_state.setdefault("view", _restored_view)
+        st.session_state.setdefault("target_date", _restored_date)
 
     nav_items = [
         ("dashboard", "ホーム"),
@@ -851,6 +898,7 @@ def main():
                 use_container_width=True,
             ):
                 st.session_state.view = view_key
+                save_nav_state()
                 st.rerun()
     st.divider()
 
@@ -1169,6 +1217,7 @@ def main():
                             st.session_state.view = "workout"
                         else:
                             st.session_state.view = "food"
+                        save_nav_state()
                         st.rerun()
 
         st.markdown(
@@ -1192,6 +1241,7 @@ def main():
 
         food_date = st.date_input("記録日", value=st.session_state.target_date)
         st.session_state.target_date = food_date
+        save_nav_state()
         f_date_str = food_date.strftime("%Y-%m-%d")
 
         # 該当日の既存ログを取得
@@ -1375,7 +1425,7 @@ def main():
 
             col_m1, col_m2 = st.columns(2)
             with col_m1:
-                manual_cal = st.number_input("カロリー (kcal)", min_value=0, step=10, value=0)
+                manual_cal = st.number_input("カロリー (kcal)", min_value=0, step=10, value=None, placeholder="0")
             with col_m2:
                 input_mode = st.radio("記録方法", ["上書き設定", "現在の記録に加算"], index=1)
 
@@ -1385,7 +1435,10 @@ def main():
                 key="manual_dish_name",
             )
 
-            if st.button("手入力で反映する", type="primary", use_container_width=True):
+            manual_clicked = st.button("手入力で反映する", type="primary", use_container_width=True)
+            if manual_clicked and manual_cal is None:
+                st.warning("カロリーを入力してください。(0 kcal にしたいときは 0 と入力してください)")
+            elif manual_clicked:
                 dish = manual_name.strip() if manual_name.strip() else "手入力"
 
                 if input_mode == "上書き設定":
@@ -1627,6 +1680,7 @@ def main():
             with c_date:
                 cardio_date = st.date_input("日付", value=st.session_state.target_date, key="cardio_date")
                 st.session_state.target_date = cardio_date
+                save_nav_state()
                 c_date_str = cardio_date.strftime("%Y-%m-%d")
 
             col_s, col_inc, col_dur = st.columns(3)
@@ -1708,7 +1762,7 @@ def main():
 
             if existing_row:
                 dur_val = existing_row.get("duration_min")
-                if dur_val is not None:
+                if dur_val:  # NULL・0 は空欄のまま表示する
                     saved_duration = int(dur_val)
                 
                 intent_val = existing_row.get("intensity")
@@ -1725,7 +1779,7 @@ def main():
                     placeholder="0",
                     key="session_duration_input"
                 )
-                duration = duration_input or 0
+                duration = duration_input or 0  # 消費カロリー計算用(空欄は0分扱い)。保存には duration_input(空欄ならNULL)を使う
             with col_int:
                 intensity = st.selectbox(
                     "運動強度",
@@ -1743,7 +1797,7 @@ def main():
                     supabase.table("daily_summaries").upsert({
                         "user_id": user_id,
                         "date": w_date_str_default,
-                        "duration_min": duration,
+                        "duration_min": duration_input,
                         "intensity": intensity,
                         "workout_burned_calories": round(
                             estimated_burn + get_cardio_burn_total(user_id, w_date_str_default), 1
@@ -1762,6 +1816,7 @@ def main():
         with col_date:
             work_date = st.date_input("日付", value=st.session_state.target_date, key="w_date")
             st.session_state.target_date = work_date
+            save_nav_state()
             w_date_str = work_date.strftime("%Y-%m-%d")
 
         # --- DB（user_profile）から前回選択した部位・種目を取得 ---
@@ -1841,7 +1896,34 @@ def main():
                 ).execute()
                 fetch_profile.clear()
 
-        col_select, col_del = st.columns([5, 1])
+        # 種目の削除ボタン: ゴミ箱アイコンだけにして、セレクトボックスと同じ高さ・下端にそろえる
+        st.markdown(
+            """
+            <style>
+            .st-key-btn_delete_start button[kind="secondary"] {
+                background-color: #fff5f5 !important;
+                border: 1px solid #fecaca !important;
+                border-radius: 0.5rem !important;
+                height: 40px !important;
+                min-height: 40px !important;
+                padding: 0 !important;
+            }
+            .st-key-btn_delete_start button[kind="secondary"]:hover {
+                background-color: #fee2e2 !important;
+                border-color: #dc2626 !important;
+            }
+            .st-key-btn_delete_start button[kind="secondary"] p,
+            .st-key-btn_delete_start button[kind="secondary"] span {
+                color: #dc2626 !important;
+            }
+            .st-key-btn_delete_start button[kind="secondary"] span[data-testid="stIconMaterial"] {
+                font-size: 1.3rem !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        col_select, col_del = st.columns([6, 1], vertical_alignment="bottom")
         with col_select:
             exercise = st.selectbox(
                 "種目", 
@@ -1852,10 +1934,13 @@ def main():
             )
 
         with col_del:
-            st.write("")
-            st.write("")
             if exercise != add_option_text and ex_list:
-                if st.button("削除", key=f"btn_delete_start_{exercise}"):
+                if st.button(
+                    ":material/delete:",
+                    key="btn_delete_start",
+                    help="この種目を削除",
+                    use_container_width=True,
+                ):
                     st.session_state[f"confirm_del_step1_{exercise}"] = True
         
         # --------------------------------------------------
@@ -1965,10 +2050,11 @@ def main():
                     "exercise": exercise,
                     "weight": weight_val,
                     "reps": reps_val,
-                    "duration_min": duration,
                     "intensity": intensity,
                     "burned_calories": 0,
                 }
+                if duration_input is not None:
+                    workout_data["duration_min"] = duration_input
                 supabase.table("workout_logs").insert(workout_data).execute()
 
                 # 2. その日の全体消費カロリーを daily_summaries に UPSERT
@@ -2035,29 +2121,32 @@ def main():
 
                     c1.write(f"**{set_no}**")
 
-                    # NULL値（None）の制御に対応した入力値の取得
-                    w_val = float(row["weight"]) if pd.notna(row["weight"]) else 0.0
-                    r_val = int(row["reps"]) if pd.notna(row["reps"]) else 0
+                    # DBがNULLのときは空欄(None)で表示する
+                    # (DataFrame化するとNULLはNaNになるため pd.notna で判定する)
+                    w_db = float(row["weight"]) if pd.notna(row["weight"]) else None
+                    r_db = int(row["reps"]) if pd.notna(row["reps"]) else None
 
                     new_weight = c2.number_input(
                         "重さ",
-                        value=float(row["weight"]) if row["weight"] is not None else 0.0,
+                        value=w_db,
                         step=2.5,
                         format="%.1f",
+                        placeholder="0.0",
                         key=f"w_{log_id}",
                         label_visibility="collapsed"
                     )
                     new_reps = c3.number_input(
-                        "回数", 
-                        value=int(row["reps"]) if row["reps"] is not None else 0, 
-                        min_value=0, 
-                        step=1, 
-                        key=f"r_{log_id}", 
+                        "回数",
+                        value=r_db,
+                        min_value=0,
+                        step=1,
+                        placeholder="0",
+                        key=f"r_{log_id}",
                         label_visibility="collapsed"
                     )
 
-                    # 数値変更時の自動更新
-                    if new_weight != float(row["weight"] or 0) or new_reps != int(row["reps"] or 0):
+                    # 数値変更時の自動更新(空欄同士は変更なし)
+                    if new_weight != w_db or new_reps != r_db:
                         supabase.table("workout_logs").update({
                             "weight": new_weight,
                             "reps": new_reps
@@ -2068,7 +2157,7 @@ def main():
                         st.rerun()
 
                     # RM計算
-                    if new_reps > 0:
+                    if new_reps and new_weight is not None:
                         est_rm = new_weight * (1 + 0.025 * new_reps)
                         c4.write(f"{est_rm:.1f} kg")
                     else:
@@ -2088,19 +2177,27 @@ def main():
                     # 追加時点の部位（part）を取得
                     ex_part = group["part"].iloc[0] if "part" in group.columns and not group["part"].empty else "胸"
                     
+                    # 重さ・回数は空(NULL)で追加する。入力されるまで0扱いにはしない
                     new_record = {
                         "user_id": user_id,
-                        "date": w_date_str,  # 修正：selected_date から w_date_str へ変更
+                        "date": w_date_str,
                         "part": ex_part,
                         "exercise": ex_name,
-                        "weight": 0.0,
-                        "reps": 0,
+                        "weight": None,
+                        "reps": None,
                         "burned_calories": 0
                     }
-                    supabase.table("workout_logs").insert(new_record).execute()
-                    invalidate_cache()
-                    st.session_state["refresh_today_workout"] = True
-                    st.rerun()
+                    try:
+                        supabase.table("workout_logs").insert(new_record).execute()
+                    except Exception as e:
+                        st.error(
+                            f"セットを追加できませんでした: {e}\n"
+                            "workout_logs の weight / reps が NULL を許可していない可能性があります。"
+                        )
+                    else:
+                        invalidate_cache()
+                        st.session_state["refresh_today_workout"] = True
+                        st.rerun()
 
                 st.markdown("<hr style='margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;'>", unsafe_allow_html=True)
         else:
