@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import plotly.express as px
 from PIL import Image, ImageOps
@@ -161,24 +162,27 @@ def fetch_exercises(part):
     return [r["name"] for r in res.data] if res.data else []
 
 
+def _fetch_part_last_date(user_id, part):
+    res = (
+        supabase.table("workout_logs")
+        .select("date")
+        .eq("user_id", user_id)
+        .eq("part", part)
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return part, (res.data[0]["date"] if res.data else None)
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_part_last_dates(user_id):
-    # 全履歴を取得せず、部位ごとに最新1件だけ取得する
-    # (全履歴取得は Supabase の既定上限1000行で打ち切られるため、古い部位が「記録なし」になる問題もあった)
-    result = {}
-    for p in PART_LIST:
-        res = (
-            supabase.table("workout_logs")
-            .select("date")
-            .eq("user_id", user_id)
-            .eq("part", p)
-            .order("date", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            result[p] = res.data[0]["date"]
-    return result
+    # 全履歴を取得せず、部位ごとに最新1件だけ取得する。
+    # 部位ごとの問い合わせは直列だと待ち時間が足し算になるため、同時に実行する
+    # (全履歴取得は Supabase の既定上限1000行で打ち切られ、古い部位が「記録なし」になる問題もあった)
+    with ThreadPoolExecutor(max_workers=len(PART_LIST)) as ex:
+        results = list(ex.map(lambda p: _fetch_part_last_date(user_id, p), PART_LIST))
+    return {p: d for p, d in results if d}
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -237,6 +241,13 @@ def get_cardio_burn_total(user_id, date_str):
         return sum(float(r.get("burned_calories") or 0) for r in (res.data or []))
     except Exception:
         return 0.0
+
+
+def invalidate_workout_cache():
+    """筋トレのセットを保存・削除したときに、影響する分だけ破棄する
+    (プロフィール・種目一覧・食事などは変わらないので残す)"""
+    for fn in (fetch_month_logs, fetch_part_last_dates, fetch_last_record, fetch_summary):
+        fn.clear()
 
 
 def invalidate_cache():
@@ -324,6 +335,38 @@ def init_default_exercises():
         pass
 
 # Gemini AIによる画像解析関数
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+def is_temporary_gemini_error(e: Exception) -> bool:
+    """混雑・一時的な障害(503/504など)かどうか。再試行すれば通る可能性がある"""
+    code = getattr(e, "code", None)
+    msg = str(e)
+    return code in (503, 504) or any(k in msg for k in ("503", "504", "UNAVAILABLE", "DEADLINE_EXCEEDED"))
+
+
+def call_gemini_with_retry(client, contents, max_attempts: int = 3):
+    """一時的なエラー(混雑など)のときだけ、数秒待って自動でやり直す"""
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        except Exception as e:
+            if is_temporary_gemini_error(e) and attempt < max_attempts - 1:
+                time.sleep(2 * (attempt + 1))  # 2秒、4秒と間隔をあける
+                continue
+            raise
+
+
+def friendly_gemini_error(e: Exception) -> str:
+    """画面に出すエラー文。混雑・上限は短い日本語に、それ以外は元の内容を出す"""
+    msg = str(e)
+    if is_temporary_gemini_error(e):
+        return "AIが混み合っています。少し待ってからもう一度お試しください。(自動で再試行しましたが応答がありませんでした)"
+    if getattr(e, "code", None) == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return "AIの利用回数の上限に達した可能性があります。しばらく待ってからもう一度お試しください。"
+    return msg
+
+
 def analyze_food_image(image: Image.Image, api_key: str):
     try:
         client = get_gemini_client(api_key)
@@ -338,9 +381,7 @@ def analyze_food_image(image: Image.Image, api_key: str):
             "description": "内訳や理由の短い補足コメント"
         }
         """
-        response = client.models.generate_content(
-            model="gemini-3.6-flash", contents=[image, prompt]
-        )
+        response = call_gemini_with_retry(client, [image, prompt])
 
         text = response.text.strip()
         if text.startswith("```json"):
@@ -353,7 +394,7 @@ def analyze_food_image(image: Image.Image, api_key: str):
 
         return json.loads(text), None
     except Exception as e:
-        return None, str(e)
+        return None, friendly_gemini_error(e)
 
 # Gemini AIによるテキスト解析関数
 def analyze_food_text(text_input: str, api_key: str):
@@ -369,9 +410,7 @@ def analyze_food_text(text_input: str, api_key: str):
             "total_calories": 推定合計カロリー(数値のみ)
         }}
         """
-    response = client.models.generate_content(
-        model="gemini-3.6-flash", contents=[prompt]
-    )
+    response = call_gemini_with_retry(client, [prompt])
 
     text = response.text.strip()
     if text.startswith("```json"):
@@ -383,7 +422,7 @@ def analyze_food_text(text_input: str, api_key: str):
 
     return json.loads(text.strip()), None
   except Exception as e:
-    return None, str(e)
+    return None, friendly_gemini_error(e)
   
 # BMR / TDEE / 目標カロリー計算
 def calculate_nutrition_targets(
@@ -2070,7 +2109,7 @@ def main():
                     pass
 
                 # キャッシュを最新化し、画面を即時更新
-                invalidate_cache()
+                invalidate_workout_cache()
                 st.session_state["refresh_today_workout"] = True
                 st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
                 st.rerun()
@@ -2152,7 +2191,7 @@ def main():
                             "reps": new_reps
                         }).eq("id", log_id).execute()
                         st.session_state["refresh_today_workout"] = True
-                        invalidate_cache()
+                        fetch_last_record.clear()  # 影響するのは「前回記録」だけ
                         st.toast("記録を更新しました！")
                         st.rerun()
 
@@ -2166,7 +2205,7 @@ def main():
                     # 削除ボタン
                     if c5.button("×", key=f"del_{log_id}", help="このセットを削除"):
                         supabase.table("workout_logs").delete().eq("id", log_id).execute()
-                        invalidate_cache()
+                        invalidate_workout_cache()
                         st.session_state["refresh_today_workout"] = True
                         st.toast("セットを削除しました。")
                         st.rerun()
@@ -2188,15 +2227,19 @@ def main():
                         "burned_calories": 0
                     }
                     try:
-                        supabase.table("workout_logs").insert(new_record).execute()
+                        res = supabase.table("workout_logs").insert(new_record).execute()
                     except Exception as e:
                         st.error(
                             f"セットを追加できませんでした: {e}\n"
                             "workout_logs の weight / reps が NULL を許可していない可能性があります。"
                         )
                     else:
-                        invalidate_cache()
-                        st.session_state["refresh_today_workout"] = True
+                        # 追加した行は手元のデータにそのまま足す(DBの再取得もキャッシュ破棄もしない)。
+                        # 空欄のセットは、その日の記録の有無・部位の最終実施日・前回記録に影響しないため。
+                        if res.data:
+                            st.session_state.workout_data_cache.append(res.data[0])
+                        else:
+                            st.session_state["refresh_today_workout"] = True
                         st.rerun()
 
                 st.markdown("<hr style='margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;'>", unsafe_allow_html=True)
