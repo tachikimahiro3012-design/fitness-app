@@ -172,9 +172,9 @@ def fetch_all_exercises():
     return out
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_last_session(user_id, exercise, before_date):
+def _query_last_session(user_id, exercise, before_date):
     # before_date より前で、この種目を最後に実施した日の全セットを返す(空欄のセットは除く)
+    # ※ スレッドからも呼べるよう、st の機能は使わない
     res = (
         supabase.table("workout_logs")
         .select("date, weight, reps")
@@ -197,6 +197,14 @@ def fetch_last_session(user_id, exercise, before_date):
             break
         sets.append({"weight": r["weight"], "reps": r["reps"]})
     return {"date": target_date, "sets": sets} if target_date else None
+
+
+def get_last_session(user_id, exercise, before_date):
+    cache = st.session_state.setdefault("last_sess_cache", {})
+    key = (exercise, before_date)
+    if key not in cache:
+        cache[key] = _query_last_session(user_id, exercise, before_date)
+    return cache[key]
 
 
 def _fetch_part_last_date(user_id, part):
@@ -283,17 +291,19 @@ def get_cardio_burn_total(user_id, date_str):
 def invalidate_workout_cache():
     """筋トレのセットを保存・削除したときに、影響する分だけ破棄する
     (プロフィール・種目一覧・食事などは変わらないので残す)"""
-    for fn in (fetch_month_logs, fetch_part_last_dates, fetch_last_record, fetch_last_session, fetch_summary):
+    for fn in (fetch_month_logs, fetch_part_last_dates, fetch_last_record, fetch_summary):
         fn.clear()
+    st.session_state.pop("last_sess_cache", None)
 
 
 def invalidate_cache():
     for fn in (
         fetch_profile, fetch_food_row, fetch_summary, fetch_month_logs,
         fetch_exercises, fetch_all_exercises, fetch_part_last_dates, fetch_last_record,
-        fetch_last_session, fetch_food_items, fetch_presets,
+        fetch_food_items, fetch_presets,
     ):
         fn.clear()
+    st.session_state.pop("last_sess_cache", None)
 
 # CSSでStreamlitのカラム自動折り返し＆ロード中の曇り（オーバーレイ）を無効化する
 st.markdown(
@@ -1915,7 +1925,6 @@ def main():
                         r for r in st.session_state.workout_data_cache
                         if r["id"] not in empty_ids
                     ]
-                    fetch_part_last_dates.clear()
                     fetch_month_logs.clear()
                 except Exception:
                     pass
@@ -1947,27 +1956,12 @@ def main():
                 row["duration_min"] = saved_duration
             return row
 
-        def on_sets_added(inserted_rows, was_first_of_day):
-            # 追加した行は手元のデータにそのまま足す(空欄のセットは前回記録などに影響しない)
+        def on_sets_added(inserted_rows):
+            # 追加した行は手元のデータにそのまま足す(DBの再取得はしない)
             if inserted_rows:
                 st.session_state.workout_data_cache.extend(inserted_rows)
             else:
                 st.session_state["refresh_today_workout"] = True
-            # その日の最初のセットのときだけ、全体の消費カロリーを daily_summaries に反映する
-            if was_first_of_day:
-                try:
-                    supabase.table("daily_summaries").upsert({
-                        "user_id": user_id,
-                        "date": w_date_str,
-                        "workout_burned_calories": round(
-                            saved_burn + get_cardio_burn_total(user_id, w_date_str), 1
-                        ),
-                    }, on_conflict="user_id,date").execute()
-                    fetch_summary.clear()
-                except Exception:
-                    pass
-            fetch_part_last_dates.clear()
-            fetch_month_logs.clear()
 
         # ==================================================
         # 画面2: 種目ごとの記録画面
@@ -1990,24 +1984,45 @@ def main():
             st.caption(f"{ex_part}　{w_date_str.replace('-', '/')}")
 
             if not today_rows:
-                first_of_day = len(st.session_state.workout_data_cache) == 0
+                rows_to_insert = [
+                    new_set_row(ex_part, selected_ex) for _ in range(INITIAL_SET_COUNT)
+                ]
+                last_key = (selected_ex, w_date_str)
+                last_cache = st.session_state.setdefault("last_sess_cache", {})
+                res = None
                 try:
-                    res = (
-                        supabase.table("workout_logs")
-                        .insert([new_set_row(ex_part, selected_ex) for _ in range(INITIAL_SET_COUNT)])
-                        .execute()
-                    )
+                    if last_key in last_cache:
+                        res = supabase.table("workout_logs").insert(rows_to_insert).execute()
+                    else:
+                        # 空欄セットの用意と前回記録の取得を同時に行う(待ち時間を短くする)
+                        with ThreadPoolExecutor(max_workers=2) as pool:
+                            f_ins = pool.submit(
+                                lambda: supabase.table("workout_logs").insert(rows_to_insert).execute()
+                            )
+                            f_last = pool.submit(
+                                _query_last_session, user_id, selected_ex, w_date_str
+                            )
+                            res = f_ins.result()
+                            try:
+                                last_cache[last_key] = f_last.result()
+                            except Exception:
+                                pass
                 except Exception as e:
+                    res = None
                     st.error(
                         f"セットを用意できませんでした: {e}\n"
                         "workout_logs の weight / reps が NULL を許可していない可能性があります。"
                     )
-                else:
-                    on_sets_added(res.data, first_of_day)
-                    st.rerun()
+                if res is not None:
+                    if res.data:
+                        on_sets_added(res.data)
+                        today_rows = res.data  # 再実行せず、そのまま続きを表示する
+                    else:
+                        st.session_state["refresh_today_workout"] = True
+                        st.rerun()
 
             # --- 前回記録(前回のセッションの全セット) ---
-            last_sess = fetch_last_session(user_id, selected_ex, w_date_str)
+            last_sess = get_last_session(user_id, selected_ex, w_date_str)
             with st.container(border=True):
                 if last_sess:
                     lines = "".join(
@@ -2053,6 +2068,9 @@ def main():
                     st.markdown(f"**{selected_ex}** の前回記録はまだありません。")
 
             # --- 今日のセット ---
+            day_had_filled = any(
+                filled_count(today_by_ex.get(n, [])) > 0 for n in ex_part_map
+            )
             if today_rows:
                 SET_COLS = [0.7, 0.8, 2.3, 0.8, 2.3, 1.8, 0.9]
                 h1, _h_a, h2, _h_b, h3, h4, h5 = st.columns(SET_COLS)
@@ -2108,10 +2126,27 @@ def main():
                             "weight": new_weight,
                             "reps": new_reps,
                         }).eq("id", log_id).execute()
-                        st.session_state["refresh_today_workout"] = True
+                        # 手元のデータも書き換える(DBの再取得も、画面の再実行もしない)
+                        row["weight"] = new_weight
+                        row["reps"] = new_reps
                         fetch_last_record.clear()
+                        fetch_part_last_dates.clear()
+                        fetch_month_logs.clear()
+                        # その日の最初の入力済みセットのときだけ、全体の消費カロリーを反映する
+                        if (not day_had_filled) and new_weight is not None and new_reps is not None:
+                            day_had_filled = True
+                            try:
+                                supabase.table("daily_summaries").upsert({
+                                    "user_id": user_id,
+                                    "date": w_date_str,
+                                    "workout_burned_calories": round(
+                                        saved_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                                    ),
+                                }, on_conflict="user_id,date").execute()
+                                fetch_summary.clear()
+                            except Exception:
+                                pass
                         st.toast("記録を更新しました！")
-                        st.rerun()
 
                     # 推定RM(O'Conner式)
                     if new_reps and new_weight is not None:
@@ -2132,7 +2167,6 @@ def main():
                 "＋ セットを追加", key=f"add_set_{selected_ex}", type="primary",
                 use_container_width=True,
             ):
-                first_of_day = len(st.session_state.workout_data_cache) == 0
                 try:
                     res = (
                         supabase.table("workout_logs")
@@ -2145,13 +2179,46 @@ def main():
                         "workout_logs の weight / reps が NULL を許可していない可能性があります。"
                     )
                 else:
-                    on_sets_added(res.data, first_of_day)
+                    on_sets_added(res.data)
                     st.rerun()
 
         # ==================================================
         # 画面1: 種目一覧
         # ==================================================
         else:
+            # --- セッション全体の設定(実施時間・運動強度): 常に表示する ---
+            red_banner("セッション設定（実施時間・運動強度）")
+            col_dur, col_int = st.columns(2)
+            with col_dur:
+                duration_input = st.number_input(
+                    "全体実施時間 (分)", min_value=0, step=5, value=saved_duration,
+                    placeholder="0", key="session_duration_input",
+                )
+            with col_int:
+                intensity = st.selectbox(
+                    "運動強度", intensity_options,
+                    index=intensity_options.index(saved_intensity),
+                    key="session_intensity_select",
+                )
+            estimated_burn = calculate_workout_burn(p_weight, duration_input or 0, intensity)
+            st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+            if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
+                try:
+                    supabase.table("daily_summaries").upsert({
+                        "user_id": user_id,
+                        "date": w_date_str,
+                        "duration_min": duration_input,
+                        "intensity": intensity,
+                        "workout_burned_calories": round(
+                            estimated_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                        ),
+                    }, on_conflict="user_id,date").execute()
+                    invalidate_cache()
+                    st.toast("セッション時間と消費カロリーを保存しました！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存時にエラーが発生しました: {e}")
+
             # 種目の削除(2段階確認)
             del_target = st.session_state.get("del_target")
             if del_target:
@@ -2320,36 +2387,6 @@ def main():
                                     invalidate_cache()
                                     st.toast(f"「{nm}」を登録しました！")
                                     st.rerun()
-
-            # --- セッション全体の設定(時間・強度) ---
-            with st.expander("セッション設定（実施時間・運動強度）"):
-                duration_input = st.number_input(
-                    "全体実施時間 (分)", min_value=0, step=5, value=saved_duration,
-                    placeholder="0", key="session_duration_input",
-                )
-                intensity = st.selectbox(
-                    "運動強度", intensity_options,
-                    index=intensity_options.index(saved_intensity),
-                    key="session_intensity_select",
-                )
-                estimated_burn = calculate_workout_burn(p_weight, duration_input or 0, intensity)
-                st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
-                if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
-                    try:
-                        supabase.table("daily_summaries").upsert({
-                            "user_id": user_id,
-                            "date": w_date_str,
-                            "duration_min": duration_input,
-                            "intensity": intensity,
-                            "workout_burned_calories": round(
-                                estimated_burn + get_cardio_burn_total(user_id, w_date_str), 1
-                            ),
-                        }, on_conflict="user_id,date").execute()
-                        invalidate_cache()
-                        st.toast("セッション時間と消費カロリーを保存しました！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"保存時にエラーが発生しました: {e}")
 
 if __name__ == "__main__":
     main()
