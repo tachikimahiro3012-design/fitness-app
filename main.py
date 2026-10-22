@@ -162,6 +162,43 @@ def fetch_exercises(part):
     return [r["name"] for r in res.data] if res.data else []
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_all_exercises():
+    # 全部位の種目を1回の問い合わせで取得する(部位ごとに6回問い合わせない)
+    res = supabase.table("exercises").select("part, name").order("id").execute()
+    out = {}
+    for r in (res.data or []):
+        out.setdefault(r["part"], []).append(r["name"])
+    return out
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_last_session(user_id, exercise, before_date):
+    # before_date より前で、この種目を最後に実施した日の全セットを返す(空欄のセットは除く)
+    res = (
+        supabase.table("workout_logs")
+        .select("date, weight, reps")
+        .eq("user_id", user_id)
+        .eq("exercise", exercise)
+        .lt("date", before_date)
+        .order("date", desc=True)
+        .order("id")
+        .limit(60)
+        .execute()
+    )
+    target_date = None
+    sets = []
+    for r in (res.data or []):
+        if r.get("weight") is None or r.get("reps") is None:
+            continue
+        if target_date is None:
+            target_date = r["date"]
+        if r["date"] != target_date:
+            break
+        sets.append({"weight": r["weight"], "reps": r["reps"]})
+    return {"date": target_date, "sets": sets} if target_date else None
+
+
 def _fetch_part_last_date(user_id, part):
     res = (
         supabase.table("workout_logs")
@@ -246,15 +283,15 @@ def get_cardio_burn_total(user_id, date_str):
 def invalidate_workout_cache():
     """筋トレのセットを保存・削除したときに、影響する分だけ破棄する
     (プロフィール・種目一覧・食事などは変わらないので残す)"""
-    for fn in (fetch_month_logs, fetch_part_last_dates, fetch_last_record, fetch_summary):
+    for fn in (fetch_month_logs, fetch_part_last_dates, fetch_last_record, fetch_last_session, fetch_summary):
         fn.clear()
 
 
 def invalidate_cache():
     for fn in (
         fetch_profile, fetch_food_row, fetch_summary, fetch_month_logs,
-        fetch_exercises, fetch_part_last_dates, fetch_last_record,
-        fetch_food_items, fetch_presets,
+        fetch_exercises, fetch_all_exercises, fetch_part_last_dates, fetch_last_record,
+        fetch_last_session, fetch_food_items, fetch_presets,
     ):
         fn.clear()
 
@@ -1775,476 +1812,544 @@ def main():
             return
 
         # --------------------------------------------------
-        # 【パターンB】従来の筋トレ記録
+        # 【パターンB】筋トレ記録: 種目一覧 → 種目ごとの記録画面
+        #   一覧で「何をやったか(セット数)」が見え、種目を押すとその画面だけで
+        #   前回記録・今日のセット入力・セット追加まで完結する(上下の行き来をなくす)
         # --------------------------------------------------
-        else:
-
-            red_banner("① セッション全体の設定")
-
-            # 今日の日付（デフォルト）を取得
-            # 下の「日付」入力(key=w_date)の最新値を優先し、別日の設定を保存してしまうのを防ぐ
-            work_date_default = st.session_state.get("w_date") or st.session_state.get("target_date", today_jst())
-            w_date_str_default = work_date_default.strftime("%Y-%m-%d")
-
-            # 既存のセッション設定（実施時間・運動強度）を DB から取得
+        # 開いている種目をURLに残す。接続が切れて新しいセッションになっても同じ画面へ戻る
+        if "workout_ex" not in st.session_state:
+            restored_ex = None
             try:
-                existing_row = fetch_summary(user_id, w_date_str_default)
+                qp = st.query_params
+                if time.time() - int(qp.get("t", "0")) <= NAV_RESTORE_SECONDS:
+                    restored_ex = qp.get("ex") or None
             except Exception:
-                existing_row = None
-            saved_duration = None
-            saved_intensity_idx = 0
-            intensity_options = [
-                "標準 (通常のウェイトトレーニング)",
-                "軽度 (ストレッチ/自重/休憩長め)",
-                "高強度 (サーキット/高密度/スーパーセット)",
+                restored_ex = None
+            st.session_state["workout_ex"] = restored_ex
+
+        def open_exercise(name):
+            st.session_state["workout_ex"] = name
+            try:
+                if name:
+                    st.query_params["ex"] = name
+                elif "ex" in st.query_params:
+                    del st.query_params["ex"]
+            except Exception:
+                pass
+
+        ex_by_part = fetch_all_exercises()
+        ex_part_map = {}
+        for _p, _names in ex_by_part.items():
+            for _n in _names:
+                ex_part_map.setdefault(_n, _p)
+
+        selected_ex = st.session_state.get("workout_ex")
+        if selected_ex and selected_ex not in ex_part_map:
+            # 削除済みなど、存在しない種目が残っていたら一覧に戻す
+            open_exercise(None)
+            selected_ex = None
+
+        # 一覧画面だけ、日付と編集モードを表示する
+        edit_mode = False
+        if not selected_ex:
+            red_banner("種目を選択")
+            c_date, c_edit = st.columns([3, 2], vertical_alignment="bottom")
+            with c_date:
+                work_date = st.date_input(
+                    "日付", value=st.session_state.target_date, key="w_date"
+                )
+                st.session_state.target_date = work_date
+            with c_edit:
+                edit_mode = st.toggle("編集（種目の削除）", key="ex_edit_mode")
+        save_nav_state()
+        w_date_str = st.session_state.target_date.strftime("%Y-%m-%d")
+
+        # --- 保存済みのセッション設定(実施時間・運動強度) ---
+        intensity_options = [
+            "標準 (通常のウェイトトレーニング)",
+            "軽度 (ストレッチ/自重/休憩長め)",
+            "高強度 (サーキット/高密度/スーパーセット)",
+        ]
+        try:
+            existing_row = fetch_summary(user_id, w_date_str)
+        except Exception:
+            existing_row = None
+        saved_duration = None
+        saved_intensity = intensity_options[0]
+        if existing_row:
+            dur_val = existing_row.get("duration_min")
+            if dur_val:  # NULL・0 は空欄のまま扱う
+                saved_duration = int(dur_val)
+            if existing_row.get("intensity") in intensity_options:
+                saved_intensity = existing_row["intensity"]
+        saved_burn = calculate_workout_burn(p_weight, saved_duration or 0, saved_intensity)
+
+        # --- 本日の筋トレ記録(セット保存または日付変更時のみ再取得) ---
+        if (
+            "last_workout_date" not in st.session_state
+            or st.session_state.last_workout_date != w_date_str
+            or st.session_state.get("refresh_today_workout", False)
+        ):
+            w_res = (
+                supabase.table("workout_logs")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("date", w_date_str)
+                .order("id")
+                .execute()
+            )
+            st.session_state.workout_data_cache = w_res.data if w_res.data else []
+            st.session_state.last_workout_date = w_date_str
+            st.session_state.refresh_today_workout = False
+
+        if not selected_ex:
+            empty_ids = [
+                r["id"] for r in st.session_state.workout_data_cache
+                if r.get("weight") is None and r.get("reps") is None
+                and r.get("exercise") in ex_part_map
             ]
-
-            if existing_row:
-                dur_val = existing_row.get("duration_min")
-                if dur_val:  # NULL・0 は空欄のまま表示する
-                    saved_duration = int(dur_val)
-                
-                intent_val = existing_row.get("intensity")
-                if intent_val in intensity_options:
-                    saved_intensity_idx = intensity_options.index(intent_val)
-
-            col_dur, col_int = st.columns(2)
-            with col_dur:
-                duration_input = st.number_input(
-                    "全体実施時間 (分)",
-                    min_value=0,
-                    step=5,
-                    value=saved_duration,
-                    placeholder="0",
-                    key="session_duration_input"
-                )
-                duration = duration_input or 0  # 消費カロリー計算用(空欄は0分扱い)。保存には duration_input(空欄ならNULL)を使う
-            with col_int:
-                intensity = st.selectbox(
-                    "運動強度",
-                    intensity_options,
-                    index=saved_intensity_idx,
-                    key="session_intensity_select"
-                )
-
-            estimated_burn = calculate_workout_burn(p_weight, duration, intensity)
-            st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
-
-            # 【追加】セッション設定の保存ボタン
-            if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
+            if empty_ids:
                 try:
-                    supabase.table("daily_summaries").upsert({
-                        "user_id": user_id,
-                        "date": w_date_str_default,
-                        "duration_min": duration_input,
-                        "intensity": intensity,
-                        "workout_burned_calories": round(
-                            estimated_burn + get_cardio_burn_total(user_id, w_date_str_default), 1
-                        ),
-                    }, on_conflict="user_id,date").execute()
-                    invalidate_cache()
-                    st.toast("セッション時間と消費カロリーを保存しました！")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"保存時にエラーが発生しました: {e}")
+                    supabase.table("workout_logs").delete().in_("id", empty_ids).execute()
+                    st.session_state.workout_data_cache = [
+                        r for r in st.session_state.workout_data_cache
+                        if r["id"] not in empty_ids
+                    ]
+                    fetch_part_last_dates.clear()
+                    fetch_month_logs.clear()
+                except Exception:
+                    pass
 
-        st.divider()
-        red_banner("② 種目の記録")
+        today_by_ex = {}
+        for r in st.session_state.workout_data_cache:
+            today_by_ex.setdefault(r["exercise"], []).append(r)
 
-        col_date, col_part = st.columns(2)
-        with col_date:
-            work_date = st.date_input("日付", value=st.session_state.target_date, key="w_date")
-            st.session_state.target_date = work_date
-            save_nav_state()
-            w_date_str = work_date.strftime("%Y-%m-%d")
+        INITIAL_SET_COUNT = 3  # 種目を開いたときに最初から用意する空欄セットの数
 
-        # --- DB（user_profile）から前回選択した部位・種目を取得 ---
-        db_last_part = profile.get("last_part", "胸") if profile else "胸"
-        db_last_ex = profile.get("last_exercise", "ベンチプレス") if profile else "ベンチプレス"
-
-        part_list = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
-        part_index = part_list.index(db_last_part) if db_last_part in part_list else 0
-
-        # ① 部位セレクトボックスの変更検知コールバック
-        def on_part_change():
-            new_p = st.session_state["part_select_key"]
-            supabase.table("user_profile").upsert(
-                {"user_id": user_id, "last_part": new_p}, on_conflict="user_id"
-            ).execute()
-            fetch_profile.clear()
-
-        with col_part:
-            part = st.selectbox(
-                "部位", 
-                part_list, 
-                index=part_index, 
-                key="part_select_key", 
-                on_change=on_part_change
+        def filled_count(rows):
+            return sum(
+                1 for r in rows
+                if r.get("weight") is not None and r.get("reps") is not None
             )
 
-        # --------------------------------------------------
-        # 【追加】選択部位の種目別「最終実施日・経過日数」一覧
-        # --------------------------------------------------
-        # 1. 選択された部位の種目一覧を取得
-        ex_list = fetch_exercises(part)
-
-
-        # --------------------------------------------------
-        # 部位ごとの「最終実施日・経過日数」一覧
-        # --------------------------------------------------
-        # 各部位の最新実施日を DB から取得(キャッシュ化)
-        all_parts = ["胸", "二頭", "三頭", "背中", "肩", "脚"]
-        
-        part_last_dates = fetch_part_last_dates(user_id)
-
-        # 部位ごとの経過日数をすっきり表示
-        with st.expander("各部位の前回実施からの経過日数", expanded=False):
-            today_obj = today_jst()
-            
-            # 2列（または3列）でコンパクトに並べる
-            cols = st.columns(3)
-            for idx, p_item in enumerate(all_parts):
-                col = cols[idx % 3]
-                with col:
-                    if p_item in part_last_dates:
-                        last_d_obj = datetime.datetime.strptime(part_last_dates[p_item], "%Y-%m-%d").date()
-                        days_ago = (today_obj - last_d_obj).days
-                        
-                        if days_ago == 0:
-                            days_str = "本日実施"
-                        else:
-                            days_str = f"{days_ago}日前"
-                            
-                        st.markdown(f"**{p_item}**: {days_str}")
-                    else:
-                        st.markdown(f"**{p_item}**: 記録なし")
-            
-        # --------------------------------------------------
-        # 種目の選択ドロップダウン
-        # --------------------------------------------------
-        add_option_text = "+ 新しい種目を追加..."
-        options = ex_list + [add_option_text]
-
-        ex_index = options.index(db_last_ex) if db_last_ex in options else 0
-
-        def on_exercise_change():
-            new_ex = st.session_state["exercise_select_key"]
-            if new_ex != add_option_text:
-                supabase.table("user_profile").upsert(
-                    {"user_id": user_id, "last_exercise": new_ex}, on_conflict="user_id"
-                ).execute()
-                fetch_profile.clear()
-
-        # 種目の削除ボタン: ゴミ箱アイコンだけにして、セレクトボックスと同じ高さ・下端にそろえる
-        st.markdown(
-            """
-            <style>
-            .st-key-btn_delete_start button[kind="secondary"] {
-                background-color: #fff5f5 !important;
-                border: 1px solid #fecaca !important;
-                border-radius: 0.5rem !important;
-                height: 40px !important;
-                min-height: 40px !important;
-                padding: 0 !important;
+        def new_set_row(part_name, ex_name, weight=None, reps=None):
+            row = {
+                "user_id": user_id,
+                "date": w_date_str,
+                "part": part_name,
+                "exercise": ex_name,
+                "weight": weight,
+                "reps": reps,
+                "intensity": saved_intensity,
+                "burned_calories": 0,
             }
-            .st-key-btn_delete_start button[kind="secondary"]:hover {
-                background-color: #fee2e2 !important;
-                border-color: #dc2626 !important;
-            }
-            .st-key-btn_delete_start button[kind="secondary"] p,
-            .st-key-btn_delete_start button[kind="secondary"] span {
-                color: #dc2626 !important;
-            }
-            .st-key-btn_delete_start button[kind="secondary"] span[data-testid="stIconMaterial"] {
-                font-size: 1.3rem !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        col_select, col_del = st.columns([6, 1], vertical_alignment="bottom")
-        with col_select:
-            exercise = st.selectbox(
-                "種目", 
-                options, 
-                index=ex_index, 
-                key="exercise_select_key", 
-                on_change=on_exercise_change
-            )
+            if saved_duration is not None:
+                row["duration_min"] = saved_duration
+            return row
 
-        with col_del:
-            if exercise != add_option_text and ex_list:
-                if st.button(
-                    ":material/delete:",
-                    key="btn_delete_start",
-                    help="この種目を削除",
-                    use_container_width=True,
-                ):
-                    st.session_state[f"confirm_del_step1_{exercise}"] = True
-        
-        # --------------------------------------------------
-        # 新規種目の追加処理
-        # --------------------------------------------------
-        if exercise == add_option_text:
-          new_ex_name = st.text_input(
-              f"追加する【{part}】の種目名を入力",
-              placeholder="例: ダンベルインクラインフライ",
-          )
-          if st.button("この種目を登録", type="primary"):
-            if new_ex_name.strip():
-              try:
-                supabase.table("exercises").insert(
-                    {"part": part, "name": new_ex_name.strip()}
-                ).execute()
-                invalidate_cache()
-                st.success(f"「{new_ex_name.strip()}」を登録しました！")
-                st.rerun()
-              except Exception:
-                st.warning("既に登録されているか、エラーが発生しました。")
+        def on_sets_added(inserted_rows, was_first_of_day):
+            # 追加した行は手元のデータにそのまま足す(空欄のセットは前回記録などに影響しない)
+            if inserted_rows:
+                st.session_state.workout_data_cache.extend(inserted_rows)
             else:
-              st.warning("種目名を入力してください。")
-
-        # --------------------------------------------------
-        # 種目の削除処理（2段階確認）
-        # --------------------------------------------------
-        # 1段階目の確認（「本当に削除しますか？」）
-        if st.session_state.get(f"confirm_del_step1_{exercise}", False):
-          st.warning(f"種目「**{exercise}**」を削除しますか？")
-          c1, c2 = st.columns(2)
-          with c1:
-            if st.button(
-                "はい（最終確認へ）",
-                key=f"btn_del_step1_yes_{exercise}",
-                type="primary",
-            ):
-              st.session_state[f"confirm_del_step1_{exercise}"] = False
-              st.session_state[f"confirm_del_step2_{exercise}"] = True
-              st.rerun()
-          with c2:
-            if st.button("キャンセル", key=f"btn_del_step1_no_{exercise}"):
-              st.session_state[f"confirm_del_step1_{exercise}"] = False
-              st.rerun()
-
-        # 2段階目の確認（「過去の記録も消えますがよろしいですか？」）
-        if st.session_state.get(f"confirm_del_step2_{exercise}", False):
-          st.error(
-              f"**警告：** 「**{exercise}**」に関連する過去のトレーニング記録や分析データもすべて削除されます。本当に削除してよろしいですか？"
-          )
-          c1, c2 = st.columns(2)
-          with c1:
-            if st.button(
-                "すべてのデータを完全に削除する",
-                key=f"btn_del_step2_yes_{exercise}",
-                type="primary",
-            ):
-              try:
-                # 1. 過去ログの削除（workout_logs）
-                supabase.table("workout_logs").delete().eq(
-                    "user_id", user_id
-                ).eq("exercise", exercise).execute()
-                # 2. 種目自体の削除（exercises）
-                supabase.table("exercises").delete().eq(
-                    "name", exercise
-                ).eq("part", part).execute()
-                invalidate_cache()
-
-                st.session_state[f"confirm_del_step2_{exercise}"] = False
-                st.success(
-                    f"「{exercise}」と関連するデータを削除しました。"
-                )
-                st.rerun()
-              except Exception as e:
-                st.error(f"削除処理中にエラーが発生しました: {e}")
-          with c2:
-            if st.button("やめる", key=f"btn_del_step2_no_{exercise}"):
-              st.session_state[f"confirm_del_step2_{exercise}"] = False
-              st.rerun()
-
-        # --------------------------------------------------
-        # 前回記録(Last Record)を表示
-        # --------------------------------------------------
-        
-        if exercise != add_option_text:
-            last_record = fetch_last_record(user_id, exercise)
-            if last_record:
-                st.info(
-                    f"**前回記録**: {last_record['date']} に {last_record['weight']}kg × {last_record['reps']}回"
-                )
-            else:
-                st.info(f"**{exercise}**の記録はまだありません")
-        
-            col1, col2 = st.columns(2)
-            with col1:
-                weight_val = st.number_input("重量 (kg)", min_value=0.0, step=2.5, value=None, placeholder="0.0") or 0.0
-            with col2:
-                reps_val = st.number_input("回数 (レップ)", min_value=0, step=1, value=None, placeholder="0") or 0
-            
-        if st.button("筋トレ記録を保存", type="primary"):
-            if exercise != add_option_text:
-                # 1. 各セットの記録（burned_calories は 0 で保存）
-                workout_data = {
-                    "user_id": user_id,
-                    "date": w_date_str,
-                    "part": part,
-                    "exercise": exercise,
-                    "weight": weight_val,
-                    "reps": reps_val,
-                    "intensity": intensity,
-                    "burned_calories": 0,
-                }
-                if duration_input is not None:
-                    workout_data["duration_min"] = duration_input
-                supabase.table("workout_logs").insert(workout_data).execute()
-
-                # 2. その日の全体消費カロリーを daily_summaries に UPSERT
+                st.session_state["refresh_today_workout"] = True
+            # その日の最初のセットのときだけ、全体の消費カロリーを daily_summaries に反映する
+            if was_first_of_day:
                 try:
                     supabase.table("daily_summaries").upsert({
                         "user_id": user_id,
                         "date": w_date_str,
                         "workout_burned_calories": round(
-                            estimated_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                            saved_burn + get_cardio_burn_total(user_id, w_date_str), 1
                         ),
                     }, on_conflict="user_id,date").execute()
+                    fetch_summary.clear()
                 except Exception:
                     pass
+            fetch_part_last_dates.clear()
+            fetch_month_logs.clear()
 
-                # キャッシュを最新化し、画面を即時更新
-                invalidate_workout_cache()
-                st.session_state["refresh_today_workout"] = True
-                st.success(f"【{part}】{exercise} ({weight_val}kg × {reps_val}回) を記録しました！")
-                st.rerun()
-            else:
-                st.warning("種目が選択されていません。先に種目を選ぶか追加してください。")
+        # ==================================================
+        # 画面2: 種目ごとの記録画面
+        # ==================================================
+        if selected_ex:
+            ex_part = ex_part_map[selected_ex]
+            today_rows = today_by_ex.get(selected_ex, [])
 
-        st.divider()
-        red_banner("本日の筋トレ記録")
-        # --- 本日の筋トレ記録データ取得(セット保存または日付変更時のみ再取得) ---
-        if "last_workout_date" not in st.session_state or st.session_state.last_workout_date != w_date_str or st.session_state.get("refresh_today_workout", False):
-            w_res = supabase.table("workout_logs").select("*").eq("user_id", user_id).eq("date", w_date_str).order("id").execute()
-            st.session_state.workout_data_cache = w_res.data if w_res.data else []
-            st.session_state.last_workout_date = w_date_str
-            st.session_state.refresh_today_workout = False
+            c_back, c_gap, c_ana = st.columns([2, 3, 2], vertical_alignment="center")
+            with c_back:
+                st.button(
+                    "← 戻る", key="ex_back", on_click=open_exercise, args=(None,),
+                    use_container_width=True,
+                )
+            with c_ana:
+                if st.button("分析", key="ex_analytics", use_container_width=True):
+                    show_exercise_analytics(user_id, selected_ex, supabase)
 
-        workout_df = pd.DataFrame(st.session_state.workout_data_cache) if st.session_state.workout_data_cache else pd.DataFrame()
+            red_banner(selected_ex)
+            st.caption(f"{ex_part}　{w_date_str.replace('-', '/')}")
 
-        # 種目ごとの表示ループ
-        if not workout_df.empty:
-            for ex_name, group in workout_df.groupby("exercise", sort=False):
-                # 1. ヘッダー部（種目名 ＋ 分析ボタン）
-                col_title, col_btn = st.columns([5, 1])
-                with col_title:
-                    st.markdown(
-                        f'''
-                        <div class="section-banner" style="margin: 0; display: flex; align-items: center;">
-                            <span>{ex_name}</span>
-                        </div>
-                        ''',
-                        unsafe_allow_html=True
+            if not today_rows:
+                first_of_day = len(st.session_state.workout_data_cache) == 0
+                try:
+                    res = (
+                        supabase.table("workout_logs")
+                        .insert([new_set_row(ex_part, selected_ex) for _ in range(INITIAL_SET_COUNT)])
+                        .execute()
                     )
-                with col_btn:
-                    if st.button("分析", key=f"analytics_{ex_name}", use_container_width=True):
-                        show_exercise_analytics(user_id, ex_name, supabase)
+                except Exception as e:
+                    st.error(
+                        f"セットを用意できませんでした: {e}\n"
+                        "workout_logs の weight / reps が NULL を許可していない可能性があります。"
+                    )
+                else:
+                    on_sets_added(res.data, first_of_day)
+                    st.rerun()
 
-                # 2. テーブルのヘッダー表示
-                h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([0.8, 2.5, 2.5, 2.0, 1.0])
-                h_col1.caption("**セット**")
-                h_col2.caption("**重さ (kg)**")
-                h_col3.caption("**回数**")
-                h_col4.caption("**推定RM**")
-                h_col5.caption("**削除**")
-                
-                # 3. 既存セット一覧のループ表示
-                for set_no, (_, row) in enumerate(group.iterrows(), start=1):
+            # --- 前回記録(前回のセッションの全セット) ---
+            last_sess = fetch_last_session(user_id, selected_ex, w_date_str)
+            with st.container(border=True):
+                if last_sess:
+                    lines = "".join(
+                        f"<div style='display:flex; gap:14px; line-height:1.7;'>"
+                        f"<span style='width:1.4em; color:#6b7280;'>{i}</span>"
+                        f"<span>{float(s['weight']):.1f} kg × {int(s['reps'])} 回</span>"
+                        f"</div>"
+                        for i, s in enumerate(last_sess["sets"], start=1)
+                    )
+                    st.markdown(
+                        f"<div style='font-weight:700; margin-bottom:4px;'>"
+                        f"前回記録　{last_sess['date'].replace('-', '/')}</div>{lines}",
+                        unsafe_allow_html=True,
+                    )
+                    if filled_count(today_rows) == 0:
+                        if st.button(
+                            "前回と同じ内容を入力", key="copy_last_session",
+                            use_container_width=True,
+                        ):
+                            prev_sets = last_sess["sets"]
+                            try:
+                                # 用意済みの空欄セットに前回の値を入れる(足りない分は追加する)
+                                for k, s in enumerate(prev_sets[:len(today_rows)]):
+                                    rid = today_rows[k]["id"]
+                                    supabase.table("workout_logs").update(
+                                        {"weight": s["weight"], "reps": s["reps"]}
+                                    ).eq("id", rid).execute()
+                                    st.session_state.pop(f"w_{rid}", None)
+                                    st.session_state.pop(f"r_{rid}", None)
+                                extra = [
+                                    new_set_row(ex_part, selected_ex, s["weight"], s["reps"])
+                                    for s in prev_sets[len(today_rows):]
+                                ]
+                                if extra:
+                                    supabase.table("workout_logs").insert(extra).execute()
+                            except Exception as e:
+                                st.error(f"コピーできませんでした: {e}")
+                            else:
+                                st.session_state["refresh_today_workout"] = True
+                                fetch_last_record.clear()
+                                st.rerun()
+                else:
+                    st.markdown(f"**{selected_ex}** の前回記録はまだありません。")
+
+            # --- 今日のセット ---
+            if today_rows:
+                SET_COLS = [0.7, 0.8, 2.3, 0.8, 2.3, 1.8, 0.9]
+                h1, _h_a, h2, _h_b, h3, h4, h5 = st.columns(SET_COLS)
+                h1.caption("**セット**")
+                h2.caption("**重さ (kg)**")
+                h3.caption("**回数**")
+                h4.caption("**推定RM**")
+                h5.caption("**削除**")
+
+                def paste_from_above(field, prev_id, cur_id):
+                    # 一つ上のセットの現在の入力値を、このセットの入力欄に入れる。
+                    # 入力欄の値が変わると、下の「数値変更時の自動更新」でDBにも保存される
+                    v = st.session_state.get(f"{field}_{prev_id}")
+                    if v is not None:
+                        st.session_state[f"{field}_{cur_id}"] = v
+
+                prev_id, prev_w, prev_r = None, None, None
+
+                for set_no, row in enumerate(today_rows, start=1):
                     log_id = row["id"]
-                    c1, c2, c3, c4, c5 = st.columns([0.8, 2.5, 2.5, 2.0, 1.0])
-
+                    c1, ca, c2, cb, c3, c4, c5 = st.columns(SET_COLS, vertical_alignment="center")
                     c1.write(f"**{set_no}**")
+                    ca.button(
+                        ":material/arrow_downward:", key=f"paste_w_{log_id}",
+                        help="一つ上のセットの重さを入れる",
+                        on_click=paste_from_above, args=("w", prev_id, log_id),
+                        disabled=(prev_w is None), use_container_width=True,
+                    )
+                    cb.button(
+                        ":material/arrow_downward:", key=f"paste_r_{log_id}",
+                        help="一つ上のセットの回数を入れる",
+                        on_click=paste_from_above, args=("r", prev_id, log_id),
+                        disabled=(prev_r is None), use_container_width=True,
+                    )
 
                     # DBがNULLのときは空欄(None)で表示する
-                    # (DataFrame化するとNULLはNaNになるため pd.notna で判定する)
-                    w_db = float(row["weight"]) if pd.notna(row["weight"]) else None
-                    r_db = int(row["reps"]) if pd.notna(row["reps"]) else None
+                    w_db = float(row["weight"]) if row.get("weight") is not None else None
+                    r_db = int(row["reps"]) if row.get("reps") is not None else None
 
                     new_weight = c2.number_input(
-                        "重さ",
-                        value=w_db,
-                        step=2.5,
-                        format="%.1f",
-                        placeholder="0.0",
-                        key=f"w_{log_id}",
-                        label_visibility="collapsed"
+                        "重さ", value=w_db, step=2.5, format="%.1f", placeholder="0.0",
+                        key=f"w_{log_id}", label_visibility="collapsed",
                     )
                     new_reps = c3.number_input(
-                        "回数",
-                        value=r_db,
-                        min_value=0,
-                        step=1,
-                        placeholder="0",
-                        key=f"r_{log_id}",
-                        label_visibility="collapsed"
+                        "回数", value=r_db, min_value=0, step=1, placeholder="0",
+                        key=f"r_{log_id}", label_visibility="collapsed",
                     )
+                    prev_id, prev_w, prev_r = log_id, new_weight, new_reps
 
                     # 数値変更時の自動更新(空欄同士は変更なし)
                     if new_weight != w_db or new_reps != r_db:
                         supabase.table("workout_logs").update({
                             "weight": new_weight,
-                            "reps": new_reps
+                            "reps": new_reps,
                         }).eq("id", log_id).execute()
                         st.session_state["refresh_today_workout"] = True
-                        fetch_last_record.clear()  # 影響するのは「前回記録」だけ
+                        fetch_last_record.clear()
                         st.toast("記録を更新しました！")
                         st.rerun()
 
-                    # RM計算
+                    # 推定RM(O'Conner式)
                     if new_reps and new_weight is not None:
-                        est_rm = new_weight * (1 + 0.025 * new_reps)
-                        c4.write(f"{est_rm:.1f} kg")
+                        c4.write(f"{new_weight * (1 + 0.025 * new_reps):.1f} kg")
                     else:
                         c4.write("-")
 
-                    # 削除ボタン
                     if c5.button("×", key=f"del_{log_id}", help="このセットを削除"):
                         supabase.table("workout_logs").delete().eq("id", log_id).execute()
                         invalidate_workout_cache()
                         st.session_state["refresh_today_workout"] = True
                         st.toast("セットを削除しました。")
                         st.rerun()
-                
-                # 4. セット追加ボタンの設置
-                st.markdown("<div style='margin-top: 8px;'></div>", unsafe_allow_html=True)
-                if st.button(f"＋ セットを追加", key=f"add_set_{ex_name}"):
-                    # 追加時点の部位（part）を取得
-                    ex_part = group["part"].iloc[0] if "part" in group.columns and not group["part"].empty else "胸"
-                    
-                    # 重さ・回数は空(NULL)で追加する。入力されるまで0扱いにはしない
-                    new_record = {
-                        "user_id": user_id,
-                        "date": w_date_str,
-                        "part": ex_part,
-                        "exercise": ex_name,
-                        "weight": None,
-                        "reps": None,
-                        "burned_calories": 0
-                    }
-                    try:
-                        res = supabase.table("workout_logs").insert(new_record).execute()
-                    except Exception as e:
-                        st.error(
-                            f"セットを追加できませんでした: {e}\n"
-                            "workout_logs の weight / reps が NULL を許可していない可能性があります。"
-                        )
-                    else:
-                        # 追加した行は手元のデータにそのまま足す(DBの再取得もキャッシュ破棄もしない)。
-                        # 空欄のセットは、その日の記録の有無・部位の最終実施日・前回記録に影響しないため。
-                        if res.data:
-                            st.session_state.workout_data_cache.append(res.data[0])
-                        else:
-                            st.session_state["refresh_today_workout"] = True
-                        st.rerun()
+            else:
+                st.info("今日のセットはまだありません。下のボタンで追加してください。")
 
-                st.markdown("<hr style='margin: 20px 0; border: none; border-top: 1px solid #e5e7eb;'>", unsafe_allow_html=True)
+            if st.button(
+                "＋ セットを追加", key=f"add_set_{selected_ex}", type="primary",
+                use_container_width=True,
+            ):
+                first_of_day = len(st.session_state.workout_data_cache) == 0
+                try:
+                    res = (
+                        supabase.table("workout_logs")
+                        .insert(new_set_row(ex_part, selected_ex))
+                        .execute()
+                    )
+                except Exception as e:
+                    st.error(
+                        f"セットを追加できませんでした: {e}\n"
+                        "workout_logs の weight / reps が NULL を許可していない可能性があります。"
+                    )
+                else:
+                    on_sets_added(res.data, first_of_day)
+                    st.rerun()
+
+        # ==================================================
+        # 画面1: 種目一覧
+        # ==================================================
         else:
-            st.info("本日の記録はまだありません。")
+            # 種目の削除(2段階確認)
+            del_target = st.session_state.get("del_target")
+            if del_target:
+                if del_target["stage"] == 1:
+                    st.warning(f"種目「**{del_target['name']}**」を削除しますか？")
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        if st.button("はい（最終確認へ）", key="del1_yes", type="primary"):
+                            del_target["stage"] = 2
+                            st.rerun()
+                    with d2:
+                        if st.button("キャンセル", key="del1_no"):
+                            st.session_state["del_target"] = None
+                            st.rerun()
+                else:
+                    st.error(
+                        f"**警告：** 「**{del_target['name']}**」に関連する過去のトレーニング記録や"
+                        "分析データもすべて削除されます。本当に削除してよろしいですか？"
+                    )
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        if st.button(
+                            "すべてのデータを完全に削除する", key="del2_yes", type="primary"
+                        ):
+                            try:
+                                supabase.table("exercises").delete().eq(
+                                    "name", del_target["name"]
+                                ).eq("part", del_target["part"]).execute()
+                                # 権限(RLS)で拒否されると、エラーにならず0件削除になるため、残っていないか確認する
+                                still = (
+                                    supabase.table("exercises").select("id")
+                                    .eq("name", del_target["name"])
+                                    .eq("part", del_target["part"]).execute()
+                                )
+                                if still.data:
+                                    st.error(
+                                        "種目を削除できませんでした。Supabase の exercises テーブルに "
+                                        "DELETE のポリシーがあるか確認してください。"
+                                    )
+                                else:
+                                    supabase.table("workout_logs").delete().eq(
+                                        "user_id", user_id
+                                    ).eq("exercise", del_target["name"]).execute()
+                                    invalidate_cache()
+                                    st.session_state["refresh_today_workout"] = True
+                                    st.session_state["del_target"] = None
+                                    st.toast(f"「{del_target['name']}」を削除しました。")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"削除処理中にエラーが発生しました: {e}")
+                    with d2:
+                        if st.button("やめる", key="del2_no"):
+                            st.session_state["del_target"] = None
+                            st.rerun()
+
+            n_ex_done = sum(1 for n in ex_part_map if filled_count(today_by_ex.get(n, [])) > 0)
+            n_sets_done = sum(filled_count(today_by_ex.get(n, [])) for n in ex_part_map)
+            if n_sets_done:
+                st.caption(f"本日の記録: {n_ex_done}種目 / 計{n_sets_done}セット")
+            else:
+                st.caption("本日の記録はまだありません。")
+
+            st.markdown(
+                """
+                <style>
+                .st-key-ex_list button { justify-content: flex-start !important; }
+                .st-key-ex_list button p { text-align: left !important; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            part_last_dates = fetch_part_last_dates(user_id)
+            today_obj = today_jst()
+
+            EX_PREVIEW_COUNT = 3  # 通常表示は3件まで。4件目以降は「すべて表示」で開く
+
+            def toggle_expand(part_name):
+                opened = st.session_state.setdefault("ex_expanded_parts", [])
+                if part_name in opened:
+                    opened.remove(part_name)
+                else:
+                    opened.append(part_name)
+
+            def start_delete(part_name, ex_name):
+                st.session_state["del_target"] = {
+                    "part": part_name, "name": ex_name, "stage": 1,
+                }
+
+            with st.container(key="ex_list"):
+                for part in PART_LIST:
+                    names = ex_by_part.get(part, [])
+                    if part in part_last_dates:
+                        last_d = datetime.datetime.strptime(
+                            part_last_dates[part], "%Y-%m-%d"
+                        ).date()
+                        days_ago = (today_obj - last_d).days
+                        days_str = "本日実施" if days_ago == 0 else f"{days_ago}日前"
+                    else:
+                        days_str = "記録なし"
+                    red_banner(f"{part} - {days_str}")
+
+                    opened_parts = st.session_state.setdefault("ex_expanded_parts", [])
+                    if edit_mode or part in opened_parts:
+                        visible_names = names
+                    else:
+                        visible_names = [
+                            n for i, n in enumerate(names)
+                            if i < EX_PREVIEW_COUNT or filled_count(today_by_ex.get(n, [])) > 0
+                        ]
+                    for name in visible_names:
+                        n_done = filled_count(today_by_ex.get(name, []))
+                        label = f"✅ {name}　{n_done}セット" if n_done else name
+                        if edit_mode:
+                            c_open, c_del = st.columns([6, 1])
+                            with c_open:
+                                st.button(
+                                    label, key=f"ex_open_{part}_{name}",
+                                    on_click=open_exercise, args=(name,),
+                                    use_container_width=True,
+                                )
+                            with c_del:
+                                st.button(
+                                    ":material/delete:", key=f"ex_del_{part}_{name}",
+                                    help="この種目を削除",
+                                    on_click=start_delete, args=(part, name),
+                                    use_container_width=True,
+                                )
+                        else:
+                            st.button(
+                                label, key=f"ex_open_{part}_{name}",
+                                on_click=open_exercise, args=(name,),
+                                use_container_width=True,
+                            )
+
+                    hidden_count = len(names) - len(visible_names)
+                    if (not edit_mode) and len(names) > EX_PREVIEW_COUNT and (
+                        part in opened_parts or hidden_count > 0
+                    ):
+                        st.button(
+                            "閉じる" if part in opened_parts else f"すべて表示（あと{hidden_count}件）",
+                            key=f"ex_more_{part}",
+                            on_click=toggle_expand, args=(part,),
+                            use_container_width=True,
+                        )
+
+                    with st.expander(f"＋ {part}の種目を追加"):
+                        new_ex_name = st.text_input(
+                            "種目名", key=f"new_ex_{part}",
+                            placeholder="例: ダンベルインクラインフライ",
+                        )
+                        if st.button("この種目を登録", key=f"reg_ex_{part}", type="primary"):
+                            nm = new_ex_name.strip()
+                            if not nm:
+                                st.warning("種目名を入力してください。")
+                            elif nm in names:
+                                st.warning("すでに登録されています。")
+                            else:
+                                try:
+                                    supabase.table("exercises").insert(
+                                        {"part": part, "name": nm}
+                                    ).execute()
+                                except Exception as e:
+                                    st.error(f"登録できませんでした: {e}")
+                                else:
+                                    invalidate_cache()
+                                    st.toast(f"「{nm}」を登録しました！")
+                                    st.rerun()
+
+            # --- セッション全体の設定(時間・強度) ---
+            with st.expander("セッション設定（実施時間・運動強度）"):
+                duration_input = st.number_input(
+                    "全体実施時間 (分)", min_value=0, step=5, value=saved_duration,
+                    placeholder="0", key="session_duration_input",
+                )
+                intensity = st.selectbox(
+                    "運動強度", intensity_options,
+                    index=intensity_options.index(saved_intensity),
+                    key="session_intensity_select",
+                )
+                estimated_burn = calculate_workout_burn(p_weight, duration_input or 0, intensity)
+                st.info(f"このセッションの推定純消費カロリー: 約 {estimated_burn} kcal")
+                if st.button("セッション設定を保存", type="primary", key="save_session_setting"):
+                    try:
+                        supabase.table("daily_summaries").upsert({
+                            "user_id": user_id,
+                            "date": w_date_str,
+                            "duration_min": duration_input,
+                            "intensity": intensity,
+                            "workout_burned_calories": round(
+                                estimated_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                            ),
+                        }, on_conflict="user_id,date").execute()
+                        invalidate_cache()
+                        st.toast("セッション時間と消費カロリーを保存しました！")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"保存時にエラーが発生しました: {e}")
 
 if __name__ == "__main__":
     main()
