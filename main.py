@@ -381,6 +381,155 @@ def init_default_exercises():
     except Exception:
         pass
 
+# ---------------------------------------------------------
+# PFC(たんぱく質・脂質・炭水化物, g)の扱い。値が無い・不正なものは None(=未入力)にする
+# ---------------------------------------------------------
+def _to_gram(v):
+    try:
+        if v is None or v == "":
+            return None
+        x = float(v)
+        if x != x or x < 0:
+            return None
+        return round(x, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_pfc(source):
+    return {
+        "protein_g": _to_gram(source.get("protein_g")),
+        "fat_g": _to_gram(source.get("fat_g")),
+        "carbs_g": _to_gram(source.get("carbs_g")),
+    }
+
+
+def pfc_text(source):
+    pfc = parse_pfc(source)
+    if all(v is None for v in pfc.values()):
+        return ""
+    def f(v):
+        return "-" if v is None else f"{v:g}"
+    return f"P {f(pfc['protein_g'])} / F {f(pfc['fat_g'])} / C {f(pfc['carbs_g'])} g"
+
+
+def sum_pfc(items):
+    # 明細からPFCの合計(g)を求める。PFCが1つも入っていない明細は数えず、件数だけ返す
+    total = {"protein_g": 0.0, "fat_g": 0.0, "carbs_g": 0.0}
+    missing = 0
+    for it in items or []:
+        pfc = parse_pfc(it)
+        if all(v is None for v in pfc.values()):
+            missing += 1
+            continue
+        for k, v in pfc.items():
+            if v is not None:
+                total[k] += v
+    return total, missing
+
+
+def pfc_shares(p, f, c):
+    # PFCのカロリー比(%)。P=4kcal/g, F=9kcal/g, C=4kcal/g。合計が0なら None
+    kp, kf, kc = p * 4, f * 9, c * 4
+    ksum = kp + kf + kc
+    if ksum <= 0:
+        return None
+    sp = round(kp / ksum * 100)
+    sf = round(kf / ksum * 100)
+    return sp, sf, 100 - sp - sf
+
+
+def calc_pfc_targets(weight, target_cal, goal, overrides=None):
+    # 目標PFC(g)。自動計算の目安:
+    #   たんぱく質: 体重1kgあたり 減量系2.0g / それ以外1.8g
+    #   脂質: 目標カロリーの25%
+    #   炭水化物: 残りのカロリー
+    # overrides に手動設定(protein_target_g など)があれば、項目ごとにそちらを優先する
+    overrides = overrides or {}
+    p_per_kg = 2.0 if "減量" in str(goal) else 1.8
+    p = float(weight) * p_per_kg
+    f = float(target_cal) * 0.25 / 9
+    c = max(0.0, (float(target_cal) - p * 4 - f * 9) / 4)
+    auto = {"protein_g": round(p), "fat_g": round(f), "carbs_g": round(c)}
+    manual_keys = {
+        "protein_g": "protein_target_g",
+        "fat_g": "fat_target_g",
+        "carbs_g": "carbs_target_g",
+    }
+    result = {}
+    for k, mk in manual_keys.items():
+        mv = _to_gram(overrides.get(mk))
+        result[k] = mv if mv is not None else auto[k]
+    return result
+
+
+def render_pfc_summary(items, targets=None):
+    total, missing = sum_pfc(items)
+    p, f, c = total["protein_g"], total["fat_g"], total["carbs_g"]
+    shares = pfc_shares(p, f, c)
+
+    def g(v):
+        return f"{round(v, 1):g}"
+
+    st.markdown(
+        """
+        <style>
+        .pfc-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 6px 0 8px; }
+        .pfc-card { background: #f8f9fa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 6px; text-align: center; }
+        .pfc-label { font-size: 0.72rem; color: #6b7280; margin-bottom: 4px; white-space: nowrap; }
+        .pfc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+        .pfc-value { font-size: 1.1rem; font-weight: 700; color: #111827; line-height: 1.2; white-space: nowrap; }
+        .pfc-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #e5e7eb; }
+        .pfc-legend { font-size: 0.72rem; color: #6b7280; margin-top: 4px; }
+        .pfc-sub { font-size: 0.68rem; color: #6b7280; margin-top: 2px; line-height: 1.3; }
+        .pfc-sub.ok { color: #16a34a; font-weight: 700; }
+        .pfc-sub.over { color: #dc2626; font-weight: 700; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    colors = ("#ef4444", "#f59e0b", "#3b82f6")
+
+    def sub_html(key, val):
+        # 目標に対する残り。たんぱく質は「達成」、脂質・炭水化物は「超過」を目立たせる
+        t = (targets or {}).get(key)
+        if t is None:
+            return ""
+        diff = t - val
+        if key == "protein_g":
+            status = f'<div class="pfc-sub">あと {g(diff)} g</div>' if diff > 0 else '<div class="pfc-sub ok">目標達成</div>'
+        else:
+            status = f'<div class="pfc-sub">あと {g(diff)} g</div>' if diff >= 0 else f'<div class="pfc-sub over">{g(-diff)} g 超過</div>'
+        return f'<div class="pfc-sub">目標 {g(t)} g</div>{status}'
+
+    cards = "".join(
+        f'<div class="pfc-card"><div class="pfc-label">'
+        f'<span class="pfc-dot" style="background:{col}"></span>{name}</div>'
+        f'<div class="pfc-value">{g(val)} g</div>{sub_html(key, val)}</div>'
+        for name, val, col, key in (
+            ("たんぱく質 P", p, colors[0], "protein_g"),
+            ("脂質 F", f, colors[1], "fat_g"),
+            ("炭水化物 C", c, colors[2], "carbs_g"),
+        )
+    )
+    html = f'<div class="pfc-grid">{cards}</div>'
+    if shares:
+        sp, sf, sc = shares
+        html += (
+            '<div class="pfc-bar">'
+            f'<div style="width:{sp}%;background:{colors[0]}"></div>'
+            f'<div style="width:{sf}%;background:{colors[1]}"></div>'
+            f'<div style="width:{sc}%;background:{colors[2]}"></div>'
+            '</div>'
+            f'<div class="pfc-legend">PFCのカロリー比　P {sp}% ・ F {sf}% ・ C {sc}%</div>'
+        )
+    st.markdown(html, unsafe_allow_html=True)
+    if not shares:
+        st.caption("PFCが入力された記録はまだありません。")
+    if missing:
+        st.caption(f"PFC未入力の記録が{missing}件あります（合計には含まれません）。")
+
+
 # Gemini AIによる画像解析関数
 GEMINI_MODEL = "gemini-3.6-flash"
 
@@ -418,12 +567,15 @@ def analyze_food_image(image: Image.Image, api_key: str):
     try:
         client = get_gemini_client(api_key)
         prompt = """
-        添付された食事の画像を解析し、おおよそのカロリー（kcal）と料理の名称・内訳を推定してください。
+        添付された食事の画像を解析し、おおよそのカロリー（kcal）、PFC（たんぱく質・脂質・炭水化物のグラム数）、料理の名称・内訳を推定してください。
         回答は必ず以下の純粋なJSONフォーマットのみで出力してください（Markdownのバッククォートや装飾は不要です）。
 
         {
             "dish_name": "推定される料理名や内容",
             "total_calories": 推定合計カロリー(数値のみ),
+            "protein_g": 推定たんぱく質のグラム数(数値のみ),
+            "fat_g": 推定脂質のグラム数(数値のみ),
+            "carbs_g": 推定炭水化物のグラム数(数値のみ),
             "meal_type": "朝食", "昼食", "夕食", "間食" のいずれか最も可能性が高いもの,
             "description": "内訳や理由の短い補足コメント"
         }
@@ -448,13 +600,16 @@ def analyze_food_text(text_input: str, api_key: str):
   try:
     client = get_gemini_client(api_key)
     prompt = f"""
-        以下の食事テキストから、合計カロリー（kcal）と整理された料理名を推定してください。
+        以下の食事テキストから、合計カロリー（kcal）、PFC（たんぱく質・脂質・炭水化物のグラム数）、整理された料理名を推定してください。
         テキスト: 「{text_input}」
 
         回答は必ず以下の純粋なJSONフォーマットのみで出力してください。
         {{
             "dish_name": "簡潔な料理名（例: ゆで卵1個）",
-            "total_calories": 推定合計カロリー(数値のみ)
+            "total_calories": 推定合計カロリー(数値のみ),
+            "protein_g": 推定たんぱく質のグラム数(数値のみ),
+            "fat_g": 推定脂質のグラム数(数値のみ),
+            "carbs_g": 推定炭水化物のグラム数(数値のみ)
         }}
         """
     response = call_gemini_with_retry(client, [prompt])
@@ -900,6 +1055,12 @@ def main():
         goal_index = goal_options.index(p_goal) if p_goal in goal_options else 5
         goal_phase = st.selectbox("現在の目的", goal_options, index=goal_index)
 
+        st.caption("目標PFC(g)・任意。空欄なら体重と目的から自動計算します。")
+        _prof = profile or {}
+        t_protein = st.number_input("目標たんぱく質 (g)", min_value=0.0, max_value=1000.0, step=5.0, value=_to_gram(_prof.get("protein_target_g")), placeholder="自動", key="pfc_target_p")
+        t_fat = st.number_input("目標脂質 (g)", min_value=0.0, max_value=1000.0, step=5.0, value=_to_gram(_prof.get("fat_target_g")), placeholder="自動", key="pfc_target_f")
+        t_carbs = st.number_input("目標炭水化物 (g)", min_value=0.0, max_value=2000.0, step=5.0, value=_to_gram(_prof.get("carbs_target_g")), placeholder="自動", key="pfc_target_c")
+
         if st.form_submit_button("設定を保存"):
             profile_data = {
                 "user_id": user_id,
@@ -909,6 +1070,9 @@ def main():
                 "weight": weight,
                 "steps": steps,
                 "goal_phase": goal_phase,
+                "protein_target_g": t_protein,
+                "fat_target_g": t_fat,
+                "carbs_target_g": t_carbs,
             }
             supabase.table("user_profile").upsert(profile_data, on_conflict="user_id").execute()
             invalidate_cache()
@@ -928,6 +1092,11 @@ def main():
         steps=p_steps,
         workout_burn=0,
         goal_phase=p_goal,
+    )
+
+    pfc_targets = calc_pfc_targets(p_weight, target_cal, p_goal, profile)
+    st.sidebar.caption(
+        f"現在のPFC目標: P {pfc_targets['protein_g']:g} / F {pfc_targets['fat_g']:g} / C {pfc_targets['carbs_g']:g} g"
     )
 
     today_str = today_jst().strftime("%Y-%m-%d")
@@ -1064,6 +1233,12 @@ def main():
             """,
             unsafe_allow_html=True,
         )
+
+        red_banner("今日のPFC")
+        try:
+            render_pfc_summary(fetch_food_items(user_id, today_str), pfc_targets)
+        except Exception:
+            st.caption("PFCを取得できませんでした。")
 
         st.divider()
 
@@ -1354,16 +1529,19 @@ def main():
             invalidate_cache()
 
         # 明細を追加して合計も更新するヘルパー
-        def add_food_item(meal_type, dish_name, calories, source):
-            # 1. 明細を保存
-            supabase.table("food_items").insert({
+        def add_food_item(meal_type, dish_name, calories, source, pfc=None):
+            # 1. 明細を保存(PFCは任意。無ければ未入力のまま)
+            item_row = {
                 "user_id": user_id,
                 "date": f_date_str,
                 "meal_type": meal_type,
                 "dish_name": dish_name,
                 "calories": float(calories),
                 "source": source,
-            }).execute()
+            }
+            if pfc:
+                item_row.update(pfc)
+            supabase.table("food_items").insert(item_row).execute()
 
             # 2. 合計を更新
             new_b, new_l, new_d, new_s = current_b, current_l, current_d, current_s
@@ -1423,11 +1601,14 @@ def main():
                         dish_name = result.get("dish_name", "食事")
                         added_cal = float(result.get("total_calories", 0))
                         description = result.get("description", "")
+                        pfc = parse_pfc(result)
 
                         st.markdown("---")
                         st.markdown("**推定結果**")
                         st.markdown(f"- 料理名: **{dish_name}**")
                         st.markdown(f"- 推定カロリー: **{int(added_cal)} kcal**")
+                        if pfc_text(pfc):
+                            st.markdown(f"- 推定PFC: **{pfc_text(pfc)}**")
                         if description:
                             st.caption(description)
 
@@ -1437,7 +1618,7 @@ def main():
                         for i, mt in enumerate(meal_types):
                             with cols[i]:
                                 if st.button(f"{mt}に追加", key=f"add_img_{mt}", use_container_width=True):
-                                    add_food_item(mt, dish_name, added_cal, "ai_image")
+                                    add_food_item(mt, dish_name, added_cal, "ai_image", pfc)
                                     st.session_state["ai_image_result"] = None
                                     st.success(f"【{mt}】「{dish_name}」（{int(added_cal)} kcal）を追加しました！")
                                     st.rerun()
@@ -1447,6 +1628,7 @@ def main():
                                 "user_id": user_id,
                                 "name": dish_name,
                                 "calories": added_cal,
+                                **pfc,
                             }).execute()
                             invalidate_cache()
                             st.toast(f"「{dish_name}」を定番メニューに保存しました！")
@@ -1476,11 +1658,14 @@ def main():
                         result = st.session_state["ai_text_result"]
                         dish_name = result.get("dish_name", "食事")
                         added_cal = float(result.get("total_calories", 0))
+                        pfc = parse_pfc(result)
 
                         st.markdown("---")
                         st.markdown("**推定結果**")
                         st.markdown(f"- 料理名: **{dish_name}**")
                         st.markdown(f"- 推定カロリー: **{int(added_cal)} kcal**")
+                        if pfc_text(pfc):
+                            st.markdown(f"- 推定PFC: **{pfc_text(pfc)}**")
 
                         st.markdown("#### 追加先を選択")
                         cols = st.columns(4)
@@ -1488,7 +1673,7 @@ def main():
                         for i, mt in enumerate(meal_types):
                             with cols[i]:
                                 if st.button(f"{mt}に追加", key=f"add_text_{mt}", use_container_width=True):
-                                    add_food_item(mt, dish_name, added_cal, "ai_text")
+                                    add_food_item(mt, dish_name, added_cal, "ai_text", pfc)
                                     st.session_state["ai_text_result"] = None
                                     st.success(f"【{mt}】「{dish_name}」（{int(added_cal)} kcal）を追加しました！")
                                     st.rerun()
@@ -1498,6 +1683,7 @@ def main():
                                 "user_id": user_id,
                                 "name": dish_name,
                                 "calories": added_cal,
+                                **pfc,
                             }).execute()
                             invalidate_cache()
                             st.toast(f"「{dish_name}」を定番メニューに保存しました！")
@@ -1520,6 +1706,15 @@ def main():
                 placeholder="例: コンビニ弁当、プロテイン",
                 key="manual_dish_name",
             )
+
+            col_mp, col_mf, col_mc = st.columns(3)
+            with col_mp:
+                manual_p = st.number_input("たんぱく質 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="manual_p")
+            with col_mf:
+                manual_f = st.number_input("脂質 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="manual_f")
+            with col_mc:
+                manual_c = st.number_input("炭水化物 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="manual_c")
+            manual_pfc = parse_pfc({"protein_g": manual_p, "fat_g": manual_f, "carbs_g": manual_c})
 
             manual_clicked = st.button("手入力で反映する", type="primary", use_container_width=True)
             if manual_clicked and manual_cal is None:
@@ -1548,13 +1743,14 @@ def main():
                             "dish_name": dish,
                             "calories": target_val,
                             "source": "manual",
+                            **manual_pfc,
                         }).execute()
 
                     st.toast(f"【{m_cat_manual}】を {int(target_val)} kcal に上書きしました！")
                 else:
                     # 加算 → 明細にも残す
                     if manual_cal > 0:
-                        add_food_item(m_cat_manual, dish, float(manual_cal), "manual")
+                        add_food_item(m_cat_manual, dish, float(manual_cal), "manual", manual_pfc)
                         st.toast(f"【{m_cat_manual}】に {int(manual_cal)} kcal を加算しました！")
                     else:
                         st.warning("カロリーを入力してください。")
@@ -1582,7 +1778,7 @@ def main():
                         col_btn, col_del = st.columns([4, 1])
                         with col_btn:
                             if st.button(f"+ {p_name} ({int(p_cal)}kcal)", key=f"preset_btn_{p_id}", use_container_width=True):
-                                add_food_item(p_cat, p_name, p_cal, "manual")
+                                add_food_item(p_cat, p_name, p_cal, "manual", parse_pfc(item))
                                 st.toast(f"【{p_cat}】に {p_name} を追加しました！")
                                 st.rerun()
                         with col_del:
@@ -1600,6 +1796,9 @@ def main():
                 with st.form("add_preset_form", clear_on_submit=True):
                     new_p_name = st.text_input("メニュー名", placeholder="例: プロテイン1杯 + バナナ")
                     new_p_cal = st.number_input("カロリー (kcal)", min_value=0, step=10, value=200)
+                    new_p_p = st.number_input("たんぱく質 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="preset_form_p")
+                    new_p_f = st.number_input("脂質 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="preset_form_f")
+                    new_p_c = st.number_input("炭水化物 (g)", min_value=0.0, step=1.0, value=None, placeholder="任意", key="preset_form_c")
                     submit_preset = st.form_submit_button("定番メニューに保存", type="primary")
 
                     if submit_preset:
@@ -1607,7 +1806,8 @@ def main():
                             supabase.table("user_presets").insert({
                                 "user_id": user_id,
                                 "name": new_p_name.strip(),
-                                "calories": new_p_cal
+                                "calories": new_p_cal,
+                                **parse_pfc({"protein_g": new_p_p, "fat_g": new_p_f, "carbs_g": new_p_c}),
                             }).execute()
                             invalidate_cache()
                             st.toast(f"「{new_p_name.strip()}」を定番メニューに登録しました！")
@@ -1701,6 +1901,7 @@ def main():
         st.markdown("<br>", unsafe_allow_html=True)
         sub_total = current_b + current_l + current_d + current_s
         st.metric("本日の合計摂取カロリー", f"{int(sub_total)} kcal")
+        render_pfc_summary(fetch_food_items(user_id, f_date_str), pfc_targets)
 
         # =============================================
         # 本日の明細履歴
@@ -1716,6 +1917,8 @@ def main():
                 with col1:
                     source_icon = {"ai_image": "📷", "ai_text": "✏️", "manual": "📌"}.get(item["source"], "•")
                     st.markdown(f"{source_icon} **{item['dish_name']}**（{item['meal_type']}）")
+                    if pfc_text(item):
+                        st.caption(pfc_text(item))
                 with col2:
                     st.markdown(f"**{int(item['calories'])} kcal**")
                 with col3:
