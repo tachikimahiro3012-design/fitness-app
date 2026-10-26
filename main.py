@@ -66,7 +66,9 @@ st.set_page_config(
 )
 
 # --------------------------------------------------
-# 画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
+# スマホ操作の補助(親ページ側にJSを1回だけ登録)
+#  1) 画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
+#  2) 種目画面で右へスワイプ → 「← 戻る」を押して種目一覧へ戻る
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
@@ -75,13 +77,14 @@ components.html(
     <script>
     (function () {
         const doc = window.parent.document;
-        if (doc.getElementById("scroll-top-tap-script")) return;  // 二重登録防止
+        if (doc.getElementById("mobile-nav-helper-script")) return;  // 二重登録防止
 
         // iframeではなく親ページ側にスクリプトを置く(再描画で消えないように)
         const s = doc.createElement("script");
-        s.id = "scroll-top-tap-script";
+        s.id = "mobile-nav-helper-script";
         s.textContent = `
             (function () {
+                // ---------- 1) ヘッダータップでトップへ ----------
                 const style = document.createElement("style");
                 style.textContent = '[data-testid="stHeader"] { cursor: pointer; }';
                 document.head.appendChild(style);
@@ -99,6 +102,39 @@ components.html(
                         if (t) t.scrollTo({ top: 0, behavior: "smooth" });
                     });
                 }, true);
+
+                // ---------- 2) スワイプで種目一覧へ戻る ----------
+                // 指を「左→右」に動かしたら戻る(iPhone標準の戻る操作と同じ向き)。
+                // 逆向き(右→左)にしたい場合は SWIPE_DIR を -1 にする。
+                const SWIPE_DIR = 1;
+                const MIN_DX = 80;      // これ以上横に動いたら有効(px)
+                const MAX_DY = 60;      // 縦のズレがこれ以内(px)
+                const EDGE_SKIP = 25;   // 画面の端はブラウザ標準の戻る操作と競合するので除外
+                const IGNORE = 'input, textarea, select, [role="slider"], [data-baseweb="slider"], ' +
+                               '[data-testid="stDataFrame"], [data-testid="stTable"], .js-plotly-plot, [role="dialog"]';
+                let sx = null, sy = null;
+
+                document.addEventListener("touchstart", function (e) {
+                    sx = sy = null;
+                    if (e.touches.length !== 1) return;
+                    const t = e.touches[0];
+                    if (t.clientX < EDGE_SKIP || t.clientX > window.innerWidth - EDGE_SKIP) return;
+                    if (e.target.closest(IGNORE)) return;
+                    sx = t.clientX; sy = t.clientY;
+                }, { passive: true });
+
+                document.addEventListener("touchend", function (e) {
+                    if (sx === null) return;
+                    const t = e.changedTouches[0];
+                    const dx = (t.clientX - sx) * SWIPE_DIR;
+                    const dy = Math.abs(t.clientY - sy);
+                    sx = sy = null;
+                    if (dx < MIN_DX || dy > MAX_DY || dx < dy * 2) return;
+                    if (document.querySelector('[role="dialog"]')) return;  // ダイアログ表示中は無効
+                    // 種目画面にだけ存在する「← 戻る」ボタン(key=ex_back)を押す
+                    const back = document.querySelector(".st-key-ex_back button");
+                    if (back) back.click();
+                }, { passive: true });
             })();
         `;
         doc.body.appendChild(s);
