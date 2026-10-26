@@ -66,6 +66,49 @@ st.set_page_config(
 )
 
 # --------------------------------------------------
+# 画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
+# --------------------------------------------------
+import streamlit.components.v1 as components
+
+components.html(
+    """
+    <script>
+    (function () {
+        const doc = window.parent.document;
+        if (doc.getElementById("scroll-top-tap-script")) return;  // 二重登録防止
+
+        // iframeではなく親ページ側にスクリプトを置く(再描画で消えないように)
+        const s = doc.createElement("script");
+        s.id = "scroll-top-tap-script";
+        s.textContent = `
+            (function () {
+                const style = document.createElement("style");
+                style.textContent = '[data-testid="stHeader"] { cursor: pointer; }';
+                document.head.appendChild(style);
+
+                document.addEventListener("click", function (e) {
+                    const header = document.querySelector('[data-testid="stHeader"]');
+                    if (!header || !header.contains(e.target)) return;
+                    if (e.target.closest("button, a, [role='button']")) return;  // メニュー等は除外
+                    const targets = [
+                        document.querySelector('[data-testid="stMain"]'),
+                        document.querySelector("section.main"),
+                        document.querySelector('[data-testid="stAppViewContainer"]'),
+                    ];
+                    targets.forEach(function (t) {
+                        if (t) t.scrollTo({ top: 0, behavior: "smooth" });
+                    });
+                }, true);
+            })();
+        `;
+        doc.body.appendChild(s);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
+# --------------------------------------------------
 # Supabase 接続初期化
 # --------------------------------------------------
 @st.cache_resource
