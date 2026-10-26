@@ -68,7 +68,7 @@ st.set_page_config(
 # --------------------------------------------------
 # スマホ操作の補助(親ページ側にJSを1回だけ登録)
 #  1) 画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
-#  2) 種目画面で右へスワイプ → 「← 戻る」を押して種目一覧へ戻る
+#  2) 種目画面で横スワイプ → 「← 戻る」を押して種目一覧へ戻る
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
@@ -77,11 +77,11 @@ components.html(
     <script>
     (function () {
         const doc = window.parent.document;
-        if (doc.getElementById("mobile-nav-helper-script")) return;  // 二重登録防止
+        if (doc.getElementById("mobile-nav-helper-v2")) return;  // 二重登録防止
 
         // iframeではなく親ページ側にスクリプトを置く(再描画で消えないように)
         const s = doc.createElement("script");
-        s.id = "mobile-nav-helper-script";
+        s.id = "mobile-nav-helper-v2";
         s.textContent = `
             (function () {
                 // ---------- 1) ヘッダータップでトップへ ----------
@@ -104,15 +104,53 @@ components.html(
                 }, true);
 
                 // ---------- 2) スワイプで種目一覧へ戻る ----------
-                // 指を「左→右」に動かしたら戻る(iPhone標準の戻る操作と同じ向き)。
-                // 逆向き(右→左)にしたい場合は SWIPE_DIR を -1 にする。
-                const SWIPE_DIR = 1;
-                const MIN_DX = 80;      // これ以上横に動いたら有効(px)
-                const MAX_DY = 60;      // 縦のズレがこれ以内(px)
-                const EDGE_SKIP = 25;   // 画面の端はブラウザ標準の戻る操作と競合するので除外
+                const ALLOW_RIGHT = true;   // 指を 左→右 に動かす
+                const ALLOW_LEFT  = true;   // 指を 右→左 に動かす(不要なら false)
+                const MIN_DX = 70;          // これ以上横に動いたら有効(px)
+                const MAX_DY = 60;          // 縦のズレがこれ以内(px)
+                const EDGE_SKIP = 20;       // 画面の端はブラウザ標準の操作と競合するので除外
                 const IGNORE = 'input, textarea, select, [role="slider"], [data-baseweb="slider"], ' +
                                '[data-testid="stDataFrame"], [data-testid="stTable"], .js-plotly-plot, [role="dialog"]';
-                let sx = null, sy = null;
+                const PAGE_LEVEL = ["HTML", "BODY"];
+                let sx = null, sy = null, lx = 0, ly = 0;
+
+                // 横スクロールできる要素(はみ出している行など)の上から始めたスワイプは無視する
+                function inScrollableX(el) {
+                    while (el && el !== document.body) {
+                        if (el.getAttribute) {
+                            const tid = el.getAttribute("data-testid");
+                            if (tid === "stMain" || tid === "stAppViewContainer" || tid === "stApp") break;
+                        }
+                        const ox = getComputedStyle(el).overflowX;
+                        if ((ox === "auto" || ox === "scroll") && el.scrollWidth > el.clientWidth + 2) return true;
+                        el = el.parentElement;
+                    }
+                    return false;
+                }
+
+                function findBackButton() {
+                    const byKey = document.querySelector(".st-key-ex_back button");
+                    if (byKey) return byKey;
+                    // 古いStreamlitではkeyのclassが付かないため、文字で探す
+                    const buttons = document.querySelectorAll("button");
+                    for (let i = 0; i < buttons.length; i++) {
+                        const txt = (buttons[i].textContent || "").trim();
+                        if (txt.length <= 6 && txt.indexOf("戻る") !== -1) return buttons[i];
+                    }
+                    return null;
+                }
+
+                function finish(x, y) {
+                    if (sx === null) return;
+                    const dx = x - sx;
+                    const dy = Math.abs(y - sy);
+                    sx = sy = null;
+                    const okDir = (dx > 0 && ALLOW_RIGHT) || (dx < 0 && ALLOW_LEFT);
+                    if (!okDir || Math.abs(dx) < MIN_DX || dy > MAX_DY || Math.abs(dx) < dy * 2) return;
+                    if (document.querySelector('[role="dialog"]')) return;  // ダイアログ表示中は無効
+                    const back = findBackButton();  // 種目画面にだけ存在する
+                    if (back) back.click();
+                }
 
                 document.addEventListener("touchstart", function (e) {
                     sx = sy = null;
@@ -120,20 +158,23 @@ components.html(
                     const t = e.touches[0];
                     if (t.clientX < EDGE_SKIP || t.clientX > window.innerWidth - EDGE_SKIP) return;
                     if (e.target.closest(IGNORE)) return;
-                    sx = t.clientX; sy = t.clientY;
+                    if (inScrollableX(e.target)) return;
+                    sx = lx = t.clientX; sy = ly = t.clientY;
+                }, { passive: true });
+
+                document.addEventListener("touchmove", function (e) {
+                    if (sx === null || !e.touches.length) return;
+                    lx = e.touches[0].clientX; ly = e.touches[0].clientY;
                 }, { passive: true });
 
                 document.addEventListener("touchend", function (e) {
-                    if (sx === null) return;
                     const t = e.changedTouches[0];
-                    const dx = (t.clientX - sx) * SWIPE_DIR;
-                    const dy = Math.abs(t.clientY - sy);
-                    sx = sy = null;
-                    if (dx < MIN_DX || dy > MAX_DY || dx < dy * 2) return;
-                    if (document.querySelector('[role="dialog"]')) return;  // ダイアログ表示中は無効
-                    // 種目画面にだけ存在する「← 戻る」ボタン(key=ex_back)を押す
-                    const back = document.querySelector(".st-key-ex_back button");
-                    if (back) back.click();
+                    finish(t ? t.clientX : lx, t ? t.clientY : ly);
+                }, { passive: true });
+
+                // ブラウザがスクロール処理を始めるとtouchendが来ない場合があるので、その時は最後の位置で判定
+                document.addEventListener("touchcancel", function () {
+                    finish(lx, ly);
                 }, { passive: true });
             })();
         `;
@@ -427,6 +468,18 @@ st.markdown(
 
     [data-testid="stColumn"] {
         min-width: 42px !important;
+    }
+
+    /* 3. 画面全体が横方向にずれる(横スワイプで動く/戻る)のを防ぐ。
+          横に長い行は、その行の中だけでスクロールする(上の stHorizontalBlock の設定) */
+    html, body,
+    [data-testid="stApp"],
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    section.main {
+        overflow-x: hidden !important;
+        overscroll-behavior-x: none !important;
+        max-width: 100vw;
     }
 
     div[data-testid="stNumberInput"] {
