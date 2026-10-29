@@ -2364,9 +2364,9 @@ def main():
                 h1, _h_a, h2, _h_b, h3, h4, h5 = st.columns(SET_COLS)
                 # 見出しは改行させない(狭いスマホ画面で「セッ/ト」「推定/RM」と割れるのを防ぐ)
                 def _hdr(col, text):
-                    col.markdown(
-                        "<div style='font-size:0.78rem; font-weight:700; white-space:nowrap; "
-                        f"color:rgba(49,51,63,0.6);'>{text}</div>",
+                    # 元と同じ st.caption を使い、文字だけ改行させない(行が潰れるのを防ぐ)
+                    col.caption(
+                        f"<span style='white-space:nowrap; font-size:0.78rem; font-weight:700;'>{text}</span>",
                         unsafe_allow_html=True,
                     )
 
