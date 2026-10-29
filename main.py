@@ -67,8 +67,7 @@ st.set_page_config(
 
 # --------------------------------------------------
 # スマホ操作の補助(親ページ側にJSを1回だけ登録)
-#  1) 画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
-#  2) 種目画面で横スワイプ → 「← 戻る」を押して種目一覧へ戻る
+#  ・画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
@@ -102,80 +101,6 @@ components.html(
                         if (t) t.scrollTo({ top: 0, behavior: "smooth" });
                     });
                 }, true);
-
-                // ---------- 2) スワイプで種目一覧へ戻る ----------
-                const ALLOW_RIGHT = true;   // 指を 左→右 に動かす
-                const ALLOW_LEFT  = true;   // 指を 右→左 に動かす(不要なら false)
-                const MIN_DX = 70;          // これ以上横に動いたら有効(px)
-                const MAX_DY = 60;          // 縦のズレがこれ以内(px)
-                const EDGE_SKIP = 20;       // 画面の端はブラウザ標準の操作と競合するので除外
-                const IGNORE = 'input, textarea, select, [role="slider"], [data-baseweb="slider"], ' +
-                               '[data-testid="stDataFrame"], [data-testid="stTable"], .js-plotly-plot, [role="dialog"]';
-                const PAGE_LEVEL = ["HTML", "BODY"];
-                let sx = null, sy = null, lx = 0, ly = 0;
-
-                // 横スクロールできる要素(はみ出している行など)の上から始めたスワイプは無視する
-                function inScrollableX(el) {
-                    while (el && el !== document.body) {
-                        if (el.getAttribute) {
-                            const tid = el.getAttribute("data-testid");
-                            if (tid === "stMain" || tid === "stAppViewContainer" || tid === "stApp") break;
-                        }
-                        const ox = getComputedStyle(el).overflowX;
-                        if ((ox === "auto" || ox === "scroll") && el.scrollWidth > el.clientWidth + 2) return true;
-                        el = el.parentElement;
-                    }
-                    return false;
-                }
-
-                function findBackButton() {
-                    const byKey = document.querySelector(".st-key-ex_back button");
-                    if (byKey) return byKey;
-                    // 古いStreamlitではkeyのclassが付かないため、文字で探す
-                    const buttons = document.querySelectorAll("button");
-                    for (let i = 0; i < buttons.length; i++) {
-                        const txt = (buttons[i].textContent || "").trim();
-                        if (txt.length <= 6 && txt.indexOf("戻る") !== -1) return buttons[i];
-                    }
-                    return null;
-                }
-
-                function finish(x, y) {
-                    if (sx === null) return;
-                    const dx = x - sx;
-                    const dy = Math.abs(y - sy);
-                    sx = sy = null;
-                    const okDir = (dx > 0 && ALLOW_RIGHT) || (dx < 0 && ALLOW_LEFT);
-                    if (!okDir || Math.abs(dx) < MIN_DX || dy > MAX_DY || Math.abs(dx) < dy * 2) return;
-                    if (document.querySelector('[role="dialog"]')) return;  // ダイアログ表示中は無効
-                    const back = findBackButton();  // 種目画面にだけ存在する
-                    if (back) back.click();
-                }
-
-                document.addEventListener("touchstart", function (e) {
-                    sx = sy = null;
-                    if (e.touches.length !== 1) return;
-                    const t = e.touches[0];
-                    if (t.clientX < EDGE_SKIP || t.clientX > window.innerWidth - EDGE_SKIP) return;
-                    if (e.target.closest(IGNORE)) return;
-                    if (inScrollableX(e.target)) return;
-                    sx = lx = t.clientX; sy = ly = t.clientY;
-                }, { passive: true });
-
-                document.addEventListener("touchmove", function (e) {
-                    if (sx === null || !e.touches.length) return;
-                    lx = e.touches[0].clientX; ly = e.touches[0].clientY;
-                }, { passive: true });
-
-                document.addEventListener("touchend", function (e) {
-                    const t = e.changedTouches[0];
-                    finish(t ? t.clientX : lx, t ? t.clientY : ly);
-                }, { passive: true });
-
-                // ブラウザがスクロール処理を始めるとtouchendが来ない場合があるので、その時は最後の位置で判定
-                document.addEventListener("touchcancel", function () {
-                    finish(lx, ly);
-                }, { passive: true });
             })();
         `;
         doc.body.appendChild(s);
@@ -2437,11 +2362,19 @@ def main():
             if today_rows:
                 SET_COLS = [0.7, 0.8, 2.3, 0.8, 2.3, 1.8, 0.9]
                 h1, _h_a, h2, _h_b, h3, h4, h5 = st.columns(SET_COLS)
-                h1.caption("**セット**")
-                h2.caption("**重さ (kg)**")
-                h3.caption("**回数**")
-                h4.caption("**推定RM**")
-                h5.caption("**削除**")
+                # 見出しは改行させない(狭いスマホ画面で「セッ/ト」「推定/RM」と割れるのを防ぐ)
+                def _hdr(col, text):
+                    col.markdown(
+                        "<div style='font-size:0.78rem; font-weight:700; white-space:nowrap; "
+                        f"color:rgba(49,51,63,0.6);'>{text}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                _hdr(h1, "セット")
+                _hdr(h2, "重さ (kg)")
+                _hdr(h3, "回数")
+                _hdr(h4, "推定RM")
+                _hdr(h5, "削除")
 
                 def paste_from_above(field, prev_id, cur_id):
                     # 一つ上のセットの現在の入力値を、このセットの入力欄に入れる。
