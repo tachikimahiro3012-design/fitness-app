@@ -475,6 +475,9 @@ st.markdown(
         flex-direction: row !important;
         flex-wrap: nowrap !important;
         overflow-x: auto !important;
+        /* 行の上で縦にスワイプしたとき、行が縦スクロールを奪って画面が進まなくなるのを防ぐ */
+        overflow-y: hidden !important;
+        overscroll-behavior: auto !important;
     }
 
     [data-testid="stColumn"] {
