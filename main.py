@@ -249,13 +249,17 @@ def fetch_summary(user_id, date_str):
 def fetch_month_logs(user_id, month_start, month_end):
     w_res = (
         supabase.table("workout_logs")
-        .select("date")
+        .select("date, part, reps")
         .eq("user_id", user_id)
         .gte("date", month_start)
         .lt("date", month_end)
         .execute()
     )
-    recorded_dates = sorted({r["date"] for r in (w_res.data or [])})
+    # 筋トレの記録がある日だけ数える(有酸素の行と、回数が空欄のセットは除く)
+    recorded_dates = sorted({
+        r["date"] for r in (w_res.data or [])
+        if r.get("part") != "有酸素" and r.get("reps") is not None
+    })
 
     f_res = (
         supabase.table("food_logs")
@@ -309,7 +313,7 @@ def _query_last_session(user_id, exercise, before_date):
     target_date = None
     sets = []
     for r in (res.data or []):
-        if r.get("weight") is None or r.get("reps") is None:
+        if r.get("reps") is None:  # 重さが空欄(自重)でも、回数があれば記録済み
             continue
         if target_date is None:
             target_date = r["date"]
@@ -317,6 +321,13 @@ def _query_last_session(user_id, exercise, before_date):
             break
         sets.append({"weight": r["weight"], "reps": r["reps"]})
     return {"date": target_date, "sets": sets} if target_date else None
+
+
+def _fmt_weight(w):
+    # 重さが空欄(None)・0 のときは自重として表示する
+    if w is None or float(w) == 0:
+        return "自重"
+    return f"{float(w):.1f} kg"
 
 
 def get_last_session(user_id, exercise, before_date):
@@ -480,6 +491,20 @@ st.markdown(
         overflow-x: hidden !important;
         overscroll-behavior-x: none !important;
         max-width: 100vw;
+    }
+
+    /* 4. 行の中に出る小さなスクロールバー(▲●▼など)を非表示にする。
+          スクロール自体はできる。画面全体のスクロールバーはそのまま */
+    [data-testid="stMainBlockContainer"],
+    [data-testid="stMainBlockContainer"] * {
+        scrollbar-width: none !important;          /* Firefox */
+        -ms-overflow-style: none !important;       /* 旧Edge */
+    }
+    [data-testid="stMainBlockContainer"]::-webkit-scrollbar,
+    [data-testid="stMainBlockContainer"] *::-webkit-scrollbar {
+        display: none !important;                  /* Chrome / Safari / Edge */
+        width: 0 !important;
+        height: 0 !important;
     }
 
     div[data-testid="stNumberInput"] {
@@ -1617,9 +1642,10 @@ def main():
             """
             <div class="cal-legend">
                 <span><span class="cal-legend-today"></span>今日</span>
-                <span><span class="cal-legend-dot"></span>筋トレした日</span>
-                <span><span class="cal-legend-num under">数字</span> = 摂取カロリー(目標以内)</span>
-                <span><span class="cal-legend-num over">数字</span> = 摂取カロリー(目標オーバー)</span>
+                <span><span class="cal-legend-dot"></span>筋トレをした日</span>
+                <span>数字は摂取カロリー（k = kcal）</span>
+                <span><span class="cal-legend-num under">緑</span>：目標以内</span>
+                <span><span class="cal-legend-num over">赤</span>：目標オーバー</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -2271,10 +2297,8 @@ def main():
         INITIAL_SET_COUNT = 3  # 種目を開いたときに最初から用意する空欄セットの数
 
         def filled_count(rows):
-            return sum(
-                1 for r in rows
-                if r.get("weight") is not None and r.get("reps") is not None
-            )
+            # 回数が入っていれば入力済み。重さが空欄(自重種目)でもチェックを付ける
+            return sum(1 for r in rows if r.get("reps") is not None)
 
         def new_set_row(part_name, ex_name, weight=None, reps=None):
             row = {
@@ -2304,16 +2328,6 @@ def main():
         if selected_ex:
             ex_part = ex_part_map[selected_ex]
             today_rows = today_by_ex.get(selected_ex, [])
-
-            c_back, c_gap, c_ana = st.columns([2, 3, 2], vertical_alignment="center")
-            with c_back:
-                st.button(
-                    "← 戻る", key="ex_back", on_click=open_exercise, args=(None,),
-                    use_container_width=True,
-                )
-            with c_ana:
-                if st.button("分析", key="ex_analytics", use_container_width=True):
-                    show_exercise_analytics(user_id, selected_ex, supabase)
 
             red_banner(selected_ex)
             st.caption(f"{ex_part}　{w_date_str.replace('-', '/')}")
@@ -2363,7 +2377,7 @@ def main():
                     lines = "".join(
                         f"<div style='display:flex; gap:14px; line-height:1.7;'>"
                         f"<span style='width:1.4em; color:#6b7280;'>{i}</span>"
-                        f"<span>{float(s['weight']):.1f} kg × {int(s['reps'])} 回</span>"
+                        f"<span>{_fmt_weight(s['weight'])} × {int(s['reps'])} 回</span>"
                         f"</div>"
                         for i, s in enumerate(last_sess["sets"], start=1)
                     )
@@ -2401,6 +2415,17 @@ def main():
                                 st.rerun()
                 else:
                     st.markdown(f"**{selected_ex}** の前回記録はまだありません。")
+
+            # --- 戻る / 分析ボタン(セット入力欄のすぐ上。スマホで見えなくなりにくい位置) ---
+            c_back, c_gap, c_ana = st.columns([2, 3, 2], vertical_alignment="center")
+            with c_back:
+                st.button(
+                    "← 戻る", key="ex_back", on_click=open_exercise, args=(None,),
+                    use_container_width=True,
+                )
+            with c_ana:
+                if st.button("分析", key="ex_analytics", use_container_width=True):
+                    show_exercise_analytics(user_id, selected_ex, supabase)
 
             # --- 今日のセット ---
             day_had_filled = any(
@@ -2468,7 +2493,7 @@ def main():
                         fetch_part_last_dates.clear()
                         fetch_month_logs.clear()
                         # その日の最初の入力済みセットのときだけ、全体の消費カロリーを反映する
-                        if (not day_had_filled) and new_weight is not None and new_reps is not None:
+                        if (not day_had_filled) and new_reps is not None:
                             day_had_filled = True
                             try:
                                 supabase.table("daily_summaries").upsert({
