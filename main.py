@@ -74,7 +74,12 @@ st.set_page_config(
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
-components.html(
+# 補助スクリプトは親ページ側に登録されて残るので、毎回の再実行で送る必要はない。
+# (起動直後の自動再実行で読み込みが間に合わない場合に備え、最初の3回だけ送る。二重登録は防止済み)
+_helper_runs = st.session_state.get("_mobile_helper_runs", 0)
+if _helper_runs < 3:
+  st.session_state["_mobile_helper_runs"] = _helper_runs + 1
+  components.html(
     """
     <script>
     (function () {
@@ -134,7 +139,11 @@ components.html(
                         setTimeout(function () { el.scrollLeft = el.scrollWidth; }, 400);
                     });
                 }
-                new MutationObserver(scrollChartsToEnd).observe(document.body, { childList: true, subtree: true });
+                let chartTimer = null;
+                new MutationObserver(function () {
+                    if (chartTimer) return;   // 変化のたびに実行せず、200msに1回までにする
+                    chartTimer = setTimeout(function () { chartTimer = null; scrollChartsToEnd(); }, 200);
+                }).observe(document.body, { childList: true, subtree: true });
             })();
         `;
         doc.body.appendChild(s);
@@ -466,15 +475,18 @@ st.markdown(
         -webkit-overflow-scrolling: touch;
     }
 
-    /* 4. 行の中に出る小さなスクロールバー(▲●▼など)を非表示にする。
-          スクロール自体はできる。画面全体のスクロールバーはそのまま */
-    [data-testid="stMainBlockContainer"],
-    [data-testid="stMainBlockContainer"] * {
+    /* 4. 横並びの行・グラフ・入力欄に出る小さなスクロールバーを非表示にする。
+          スクロール自体はできる。画面全体のスクロールバーはそのまま。
+          (全要素に指定すると描画が重くなるため、対象を絞っている) */
+    [data-testid="stHorizontalBlock"],
+    [data-testid="stPlotlyChart"],
+    [data-testid="stTextArea"] textarea {
         scrollbar-width: none !important;          /* Firefox */
         -ms-overflow-style: none !important;       /* 旧Edge */
     }
-    [data-testid="stMainBlockContainer"]::-webkit-scrollbar,
-    [data-testid="stMainBlockContainer"] *::-webkit-scrollbar {
+    [data-testid="stHorizontalBlock"]::-webkit-scrollbar,
+    [data-testid="stPlotlyChart"]::-webkit-scrollbar,
+    [data-testid="stTextArea"] textarea::-webkit-scrollbar {
         display: none !important;                  /* Chrome / Safari / Edge */
         width: 0 !important;
         height: 0 !important;
@@ -2819,4 +2831,10 @@ def main():
                                     st.rerun()
 
 if __name__ == "__main__":
+    _t0 = time.perf_counter()
     main()
+    try:
+        if st.query_params.get("debug") == "1":
+            st.caption(f"⏱ この画面の処理時間(サーバー側): {time.perf_counter() - _t0:.2f} 秒")
+    except Exception:
+        pass
