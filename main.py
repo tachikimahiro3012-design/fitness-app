@@ -70,6 +70,7 @@ st.set_page_config(
 # スマホ操作の補助(親ページ側にJSを1回だけ登録)
 #  ・画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
 #  ・文章入力欄(st.text_area)を、改行・入力に合わせて自動で広げる
+#  ・横に長い分析グラフを、最新(右端)の位置から表示する
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
@@ -122,6 +123,18 @@ components.html(
                 document.addEventListener("focusin", function (e) {
                     if (isTextArea(e.target)) autosize(e.target);   // 入力済みの内容があるときも合わせる
                 }, true);
+
+                // ---------- 3) 横に長いグラフは、最新(右端)の位置から表示する ----------
+                function scrollChartsToEnd() {
+                    document.querySelectorAll('[data-testid="stPlotlyChart"]').forEach(function (el) {
+                        if (el.dataset.endDone) return;
+                        if (el.scrollWidth <= el.clientWidth + 4) return;
+                        el.dataset.endDone = "1";
+                        el.scrollLeft = el.scrollWidth;
+                        setTimeout(function () { el.scrollLeft = el.scrollWidth; }, 400);
+                    });
+                }
+                new MutationObserver(scrollChartsToEnd).observe(document.body, { childList: true, subtree: true });
             })();
         `;
         doc.body.appendChild(s);
@@ -442,11 +455,15 @@ st.markdown(
         max-width: 100vw;
     }
 
-    /* 5. グラフの上で縦にスワイプしたときは、グラフではなく画面をスクロールさせる(横はグラフが動く) */
-    .js-plotly-plot .nsewdrag,
-    .js-plotly-plot .draglayer,
-    .js-plotly-plot .draglayer * {
-        touch-action: pan-y !important;
+    /* 5. グラフは枠で囲み、横に長いときは枠の中だけ横スクロールさせる。
+          縦方向はスクロールさせない(縦のスワイプは画面のスクロールにする) */
+    [data-testid="stPlotlyChart"] {
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #ffffff;
+        -webkit-overflow-scrolling: touch;
     }
 
     /* 4. 行の中に出る小さなスクロールバー(▲●▼など)を非表示にする。
@@ -1040,8 +1057,10 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
   date_fmt = "%m/%d" if dates.dt.year.nunique() == 1 else "%y/%m/%d"
   labels = dates.dt.strftime(date_fmt).tolist()
 
-  # 折れ線グラフのみ。横方向にだけ動かせる(縦方向の移動・拡大縮小は不可)
-  VISIBLE = 8  # 最初に表示する直近の点の数。それより古い分は横にスワイプして見る
+  # 折れ線グラフのみ。グラフ自体は動かさず(静的表示)、横に長い場合は枠ごと横スクロールさせる。
+  # グラフ内に触れても、縦のスワイプは普通に画面のスクロールになる。
+  PX_PER_POINT = 72   # 1回分の横幅(px)
+  FIT_POINTS = 5      # この回数以下なら画面幅にぴったり収める
 
   def line_chart(title, values, fmt, key):
     st.markdown(f"**{title}**")
@@ -1063,29 +1082,29 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
         cliponaxis=False, hoverinfo="skip",
     ))
     fig.update_layout(
-        height=260, margin=dict(l=8, r=8, t=16, b=8),
-        dragmode="pan", hovermode=False, showlegend=False,
+        height=240, margin=dict(l=20, r=24, t=28, b=44),
+        dragmode=False, hovermode=False, showlegend=False,
         plot_bgcolor="white", paper_bgcolor="white",
     )
+    if n > FIT_POINTS:
+        fig.update_layout(width=n * PX_PER_POINT + 44)
     fig.update_xaxes(
-        type="category", fixedrange=False, showgrid=True, gridcolor="#e5e7eb",
-        tickfont=dict(size=11),
+        type="category", showgrid=True, gridcolor="#e5e7eb",
+        tickfont=dict(size=11), automargin=True,
     )
-    if n > VISIBLE:
-        fig.update_xaxes(range=[n - VISIBLE - 0.5, n - 0.5])
+    # 各点に数値を表示しているので、縦軸の目盛りは出さない(スマホで見切れるため)
     fig.update_yaxes(
-        fixedrange=True, range=[y_lo, y_hi], showgrid=True, gridcolor="#e5e7eb",
-        tickfont=dict(size=11),
+        range=[y_lo, y_hi], showgrid=True, gridcolor="#e5e7eb",
+        showticklabels=False, zeroline=False,
     )
     st.plotly_chart(
-        fig, use_container_width=True, theme=None, key=key,
-        config={
-            "displayModeBar": False, "scrollZoom": False, "doubleClick": False,
-            "showAxisDragHandles": False,
-        },
+        fig, use_container_width=(n <= FIT_POINTS), theme=None, key=key,
+        config={"staticPlot": True, "displayModeBar": False},
     )
 
   st.divider()
+  if len(daily_summary) > FIT_POINTS:
+      st.caption("グラフは左右にスワイプすると過去の記録が見られます。")
   line_chart("最大重量 (kg)", daily_summary["max_weight"], lambda v: f"{v:g}", f"ana_w_{exercise_name}")
   line_chart("推定1RM (kg)", daily_summary["max_1rm"], lambda v: f"{v:.1f}", f"ana_rm_{exercise_name}")
   line_chart("総挙上量 Volume (kg)", daily_summary["total_volume"], lambda v: f"{int(v):,}", f"ana_v_{exercise_name}")
