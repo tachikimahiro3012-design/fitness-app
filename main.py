@@ -68,6 +68,7 @@ st.set_page_config(
 # --------------------------------------------------
 # スマホ操作の補助(親ページ側にJSを1回だけ登録)
 #  ・画面上部の空白(ヘッダー部分)をタップ → 一番上へスクロール
+#  ・文章入力欄(st.text_area)を、改行・入力に合わせて自動で広げる
 # --------------------------------------------------
 import streamlit.components.v1 as components
 
@@ -100,6 +101,25 @@ components.html(
                     targets.forEach(function (t) {
                         if (t) t.scrollTo({ top: 0, behavior: "smooth" });
                     });
+                }, true);
+
+                // ---------- 2) 文章入力欄を、改行・入力に合わせて自動で広げる ----------
+                const MAX_H = 420;  // これ以上は広げず、欄の中でスクロールする(px)
+                function autosize(ta) {
+                    if (!ta.dataset.minH) ta.dataset.minH = String(ta.offsetHeight || 100);
+                    ta.style.height = "auto";
+                    const h = Math.min(Math.max(ta.scrollHeight + 2, Number(ta.dataset.minH)), MAX_H);
+                    ta.style.height = h + "px";
+                    ta.style.overflowY = ta.scrollHeight + 2 > MAX_H ? "auto" : "hidden";
+                }
+                function isTextArea(el) {
+                    return el && el.tagName === "TEXTAREA" && el.closest('[data-testid="stTextArea"]');
+                }
+                document.addEventListener("input", function (e) {
+                    if (isTextArea(e.target)) autosize(e.target);
+                }, true);
+                document.addEventListener("focusin", function (e) {
+                    if (isTextArea(e.target)) autosize(e.target);   // 入力済みの内容があるときも合わせる
                 }, true);
             })();
         `;
@@ -1724,7 +1744,7 @@ def main():
                     text_input = st.text_area(
                         "食べたものを文章で入力",
                         placeholder="例: プロテイン1スクープとバナナ1本、ゆで卵2個",
-                        height=100,
+                        height=120,
                         key="food_text_input",
                     )
 
@@ -2344,11 +2364,62 @@ def main():
                 else:
                     st.markdown(f"**{selected_ex}** の前回記録はまだありません。")
 
+            def save_pending_sets():
+                # 入力欄に打った値のうち、まだDBへ保存されていないものを保存する。
+                # 入力直後に「戻る」を押すと、保存処理(下のセット行の処理)に届かず、
+                # 最後に打った回数が消えてしまうため、戻る前にここで保存する。
+                had_filled = any(
+                    filled_count(today_by_ex.get(n, [])) > 0 for n in ex_part_map
+                )
+                changed = False
+                for _row in today_by_ex.get(selected_ex, []):
+                    _id = _row["id"]
+                    wk, rk = f"w_{_id}", f"r_{_id}"
+                    if wk not in st.session_state and rk not in st.session_state:
+                        continue
+                    w_old = float(_row["weight"]) if _row.get("weight") is not None else None
+                    r_old = int(_row["reps"]) if _row.get("reps") is not None else None
+                    w_new = st.session_state.get(wk, w_old)
+                    r_new = st.session_state.get(rk, r_old)
+                    if w_new == w_old and r_new == r_old:
+                        continue
+                    try:
+                        supabase.table("workout_logs").update(
+                            {"weight": w_new, "reps": r_new}
+                        ).eq("id", _id).execute()
+                    except Exception:
+                        continue
+                    _row["weight"] = w_new
+                    _row["reps"] = r_new
+                    changed = True
+                if not changed:
+                    return
+                fetch_last_record.clear()
+                fetch_part_last_dates.clear()
+                fetch_month_logs.clear()
+                # その日で最初の入力済みセットなら、全体の消費カロリーも反映する
+                if (not had_filled) and filled_count(today_by_ex.get(selected_ex, [])) > 0:
+                    try:
+                        supabase.table("daily_summaries").upsert({
+                            "user_id": user_id,
+                            "date": w_date_str,
+                            "workout_burned_calories": round(
+                                saved_burn + get_cardio_burn_total(user_id, w_date_str), 1
+                            ),
+                        }, on_conflict="user_id,date").execute()
+                        fetch_summary.clear()
+                    except Exception:
+                        pass
+
+            def go_back():
+                save_pending_sets()
+                open_exercise(None)
+
             # --- 戻る / 分析ボタン(セット入力欄のすぐ上。スマホで見えなくなりにくい位置) ---
             c_back, c_gap, c_ana = st.columns([2, 3, 2], vertical_alignment="center")
             with c_back:
                 st.button(
-                    "← 戻る", key="ex_back", on_click=open_exercise, args=(None,),
+                    "← 戻る", key="ex_back", on_click=go_back,
                     use_container_width=True,
                 )
             with c_ana:
