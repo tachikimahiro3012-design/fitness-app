@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from PIL import Image, ImageOps
 import streamlit as st
 from google import genai
@@ -439,6 +440,13 @@ st.markdown(
         overflow-x: hidden !important;
         overscroll-behavior-x: none !important;
         max-width: 100vw;
+    }
+
+    /* 5. グラフの上で縦にスワイプしたときは、グラフではなく画面をスクロールさせる(横はグラフが動く) */
+    .js-plotly-plot .nsewdrag,
+    .js-plotly-plot .draglayer,
+    .js-plotly-plot .draglayer * {
+        touch-action: pan-y !important;
     }
 
     /* 4. 行の中に出る小さなスクロールバー(▲●▼など)を非表示にする。
@@ -961,7 +969,7 @@ def calculate_cardio_burn(weight_kg, speed_kmh, incline_percent, duration_min):
 # --------------------------------------------------
 # 種目別パフォーマンス分析ダイアログ
 # --------------------------------------------------
-@st.dialog("種目別パフォーマンス分析", width="large")
+@st.dialog("パフォーマンス分析", width="large")
 def show_exercise_analytics(user_id, exercise_name, supabase):
   red_banner(exercise_name)
 
@@ -1007,45 +1015,81 @@ def show_exercise_analytics(user_id, exercise_name, supabase):
       .reset_index()
   )
 
-  # 数値（メトリクス）表示
-  c1, c2, c3, c4 = st.columns(4)
-  c1.metric("Max Weight", f"{daily_summary['max_weight'].max():.1f} kg")
-  c2.metric("Max Reps", f"{int(daily_summary['max_reps'].max())} 回")
-  c3.metric("Max 1RM", f"{daily_summary['max_1rm'].max():.1f} kg")
-  c4.metric("最高1日Volume", f"{int(daily_summary['total_volume'].max()):,} kg")
+  # 数値(メトリクス): スマホでも「…」で省略されないよう、2×2のカードで表示する
+  cards = [
+      ("Max Weight", f"{daily_summary['max_weight'].max():g} kg"),
+      ("Max Reps", f"{int(daily_summary['max_reps'].max())} 回"),
+      ("Max 1RM", f"{daily_summary['max_1rm'].max():.1f} kg"),
+      ("最高1日Volume", f"{int(daily_summary['total_volume'].max()):,} kg"),
+  ]
+  st.markdown(
+      '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">'
+      + "".join(
+          '<div style="background:#f6f7f9; border:1px solid #e5e7eb; border-radius:10px; padding:10px 12px;">'
+          f'<div style="font-size:0.75rem; color:#6b7280; white-space:nowrap;">{label}</div>'
+          f'<div style="font-size:1.35rem; font-weight:700; color:#111827; white-space:nowrap;">{value}</div>'
+          '</div>'
+          for label, value in cards
+      )
+      + '</div>',
+      unsafe_allow_html=True,
+  )
+
+  # 日付ラベル(同じ年なら「月/日」、年をまたぐなら「年/月/日」)
+  dates = pd.to_datetime(daily_summary["date"])
+  date_fmt = "%m/%d" if dates.dt.year.nunique() == 1 else "%y/%m/%d"
+  labels = dates.dt.strftime(date_fmt).tolist()
+
+  # 折れ線グラフのみ。横方向にだけ動かせる(縦方向の移動・拡大縮小は不可)
+  VISIBLE = 8  # 最初に表示する直近の点の数。それより古い分は横にスワイプして見る
+
+  def line_chart(title, values, fmt, key):
+    st.markdown(f"**{title}**")
+    vals = [float(v) for v in values]
+    n = len(vals)
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * 0.2 if hi > lo else max(abs(hi) * 0.2, 1.0)
+    y_lo = lo - pad
+    if lo >= 0 and y_lo < 0:
+        y_lo = 0
+    y_hi = hi + pad * 1.5  # 数値ラベルが切れないよう上に余白
+
+    fig = go.Figure(go.Scatter(
+        x=labels, y=vals, mode="lines+markers+text",
+        text=[fmt(v) for v in vals], textposition="top center",
+        line=dict(color="#111827", width=2),
+        marker=dict(color="#111827", size=8),
+        textfont=dict(size=12, color="#4b5563"),
+        cliponaxis=False, hoverinfo="skip",
+    ))
+    fig.update_layout(
+        height=260, margin=dict(l=8, r=8, t=16, b=8),
+        dragmode="pan", hovermode=False, showlegend=False,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    fig.update_xaxes(
+        type="category", fixedrange=False, showgrid=True, gridcolor="#e5e7eb",
+        tickfont=dict(size=11),
+    )
+    if n > VISIBLE:
+        fig.update_xaxes(range=[n - VISIBLE - 0.5, n - 0.5])
+    fig.update_yaxes(
+        fixedrange=True, range=[y_lo, y_hi], showgrid=True, gridcolor="#e5e7eb",
+        tickfont=dict(size=11),
+    )
+    st.plotly_chart(
+        fig, use_container_width=True, theme=None, key=key,
+        config={
+            "displayModeBar": False, "scrollZoom": False, "doubleClick": False,
+            "showAxisDragHandles": False,
+        },
+    )
 
   st.divider()
-
-  # グラフ表示タブ
-  tab1, tab2 = st.tabs(["重量・1RM 推移", "総挙上量 (Volume)"])
-
-  with tab1:
-    fig = px.line(
-        daily_summary,
-        x="date",
-        y=["max_weight", "max_1rm"],
-        labels={"value": "重量 (kg)", "date": "日付", "variable": "指標"},
-        title="最高重量・推定1RM の推移",
-        markers=True,
-    )
-    fig.for_each_trace(
-        lambda t: t.update(
-            name="最高重量 (kg)" if t.name == "max_weight" else "推定1RM (kg)"
-        )
-    )
-    fig.update_xaxes(type="category")
-    st.plotly_chart(fig, use_container_width=True)
-
-  with tab2:
-    fig_vol = px.bar(
-        daily_summary,
-        x="date",
-        y="total_volume",
-        labels={"total_volume": "総挙上量 (kg)", "date": "日付"},
-        title="日別の総トレーニング負荷 (Volume)",
-    )
-    fig_vol.update_xaxes(type="category")
-    st.plotly_chart(fig_vol, use_container_width=True)
+  line_chart("最大重量 (kg)", daily_summary["max_weight"], lambda v: f"{v:g}", f"ana_w_{exercise_name}")
+  line_chart("推定1RM (kg)", daily_summary["max_1rm"], lambda v: f"{v:.1f}", f"ana_rm_{exercise_name}")
+  line_chart("総挙上量 Volume (kg)", daily_summary["total_volume"], lambda v: f"{int(v):,}", f"ana_v_{exercise_name}")
+  line_chart("最大回数 (回)", daily_summary["max_reps"], lambda v: f"{int(v)}", f"ana_r_{exercise_name}")
 
 def red_banner(text: str):
     st.markdown(f'<div class="section-banner">{text}</div>', unsafe_allow_html=True)
